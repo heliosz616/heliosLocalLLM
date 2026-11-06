@@ -1,0 +1,104 @@
+llama_add_compile_flags()
+
+#
+# libraries
+#
+
+# llama
+
+file(GLOB LLAMA_MODELS_SOURCES "models/*.cpp")
+
+set(LLAMA_CORE_SOURCES
+    llama.cpp
+    llama-adapter.cpp
+    llama-arch.cpp
+    llama-batch.cpp
+    llama-chat.cpp
+    llama-context.cpp
+    llama-cparams.cpp
+    llama-grammar.cpp
+    llama-graph.cpp
+    llama-hparams.cpp
+    llama-impl.cpp
+    llama-io.cpp
+    llama-kv-cache.cpp
+    llama-lazy-reader.cpp
+    llama-kv-cache-iswa.cpp
+    llama-kv-cache-dsa.cpp
+    llama-kv-cache-dsa-iswa.cpp
+    llama-kv-cache-msa.cpp
+    llama-kv-cache-dsv4.cpp
+    llama-memory.cpp
+    llama-moe-cache.cpp
+    llama-memory-hybrid.cpp
+    llama-memory-hybrid-iswa.cpp
+    llama-memory-hybrid-idx.cpp
+    llama-memory-recurrent.cpp
+    llama-mmap.cpp
+    llama-model-loader.cpp
+    llama-model-saver.cpp
+    llama-model.cpp
+    llama-quant.cpp
+    llama-sampler.cpp
+    llama-vocab.cpp
+    unicode-data.cpp
+    unicode.cpp
+)
+
+add_library(llama
+            ../include/llama.h
+            ${LLAMA_CORE_SOURCES}
+            unicode.h
+            ${LLAMA_MODELS_SOURCES}
+            )
+
+set_target_properties(llama PROPERTIES
+    VERSION ${LLAMA_VERSION_BASE}
+    SOVERSION ${LLAMA_VERSION_MAJOR}
+    MACHO_CURRENT_VERSION 0 # keep macOS linker from seeing oversized version number
+    UNITY_BUILD ON
+    UNITY_BUILD_BATCH_SIZE 16
+)
+
+# exclude non-model sources from unity build
+set_source_files_properties(${LLAMA_CORE_SOURCES} ../include/llama.h unicode.h
+    PROPERTIES SKIP_UNITY_BUILD_INCLUSION ON)
+
+configure_file(llama-version.h.in ${CMAKE_CURRENT_BINARY_DIR}/llama-version.h @ONLY)
+
+target_include_directories(llama PRIVATE . ${CMAKE_CURRENT_BINARY_DIR})
+target_include_directories(llama PUBLIC ../include)
+target_compile_features   (llama PRIVATE cxx_std_17) # don't bump
+
+# -Wshadow catches the dangerous "declaration shadows a local variable" class in src/ (the
+# mask-chain bug of 2026-09-11 was one). The shared C/CXX warning list already carries it for C;
+# enable it for the llama C++ target as well.
+
+target_link_libraries(llama PUBLIC ggml)
+
+if (LLAMA_ALL_WARNINGS AND NOT MSVC)
+    # -Wshadow catches the dangerous "declaration shadows a local variable" class in src/ (the
+    # mask-chain bug of 2026-09-11 was one).  GCC's -Wshadow additionally reports the ubiquitous
+    # "declaration shadows a member" constructor idiom and "hides constructor", which the delivery
+    # does not police and which the container build (GCC host compiler) surfaced by the thousand;
+    # -Wshadow=local keeps the dangerous local-shadow class and drops that member/global output.
+    # clang has no =local form, so it keeps plain -Wshadow and therefore *does* report the
+    # "declaration shadows a field" idiom that upstream uses: 9 standing warnings, all benign and
+    # deliberately not renamed.  Eight are llama-model.cpp's `llama_model_loader * ml` member against
+    # the `ml` parameter of its `load_*()` overrides -- renaming that parameter to `ml_l` re-skinned
+    # every re-base conflict in the file for no correctness gain (TODO #101), so upstream's name stays
+    # -- and the ninth is `build_amax_src1_f16()`'s `n_embd` local in llama-graph.cpp.  Read a
+    # -Wshadow hit in those two files as that idiom; a hit anywhere else is the class this flag exists
+    # for.
+    if (CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+        target_compile_options(llama PRIVATE $<$<COMPILE_LANGUAGE:CXX>:-Wshadow=local>)
+    else()
+        target_compile_options(llama PRIVATE $<$<COMPILE_LANGUAGE:CXX>:-Wshadow>)
+    endif()
+endif()
+
+if (BUILD_SHARED_LIBS)
+    set_target_properties(llama PROPERTIES POSITION_INDEPENDENT_CODE ON)
+    target_compile_definitions(llama PRIVATE LLAMA_BUILD)
+    target_compile_definitions(llama PUBLIC  LLAMA_SHARED)
+endif()

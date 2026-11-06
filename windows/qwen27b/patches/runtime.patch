@@ -1,0 +1,1249 @@
+diff --git a/common/common.cpp b/common/common.cpp
+index c301c22..4b9a259 100644
+--- a/common/common.cpp
++++ b/common/common.cpp
+@@ -2382,40 +2382,36 @@ void common_prompt_checkpoint::update_dft(
+     }
+ }
+ 
+-void common_prompt_checkpoint::load_tgt(
++bool common_prompt_checkpoint::load_tgt(
+         llama_context * ctx,
+         llama_seq_id seq_id,
+         llama_state_seq_flags flags) const {
+     if (ctx == nullptr) {
+-        return;
++        return true;
+     }
+ 
+     if (data_tgt.empty()) {
+-        return;
++        return true;
+     }
+ 
+     const size_t n = llama_state_seq_set_data_ext(ctx, data_tgt.data(), data_tgt.size(), seq_id, flags);
+-    if (n != data_tgt.size()) {
+-        GGML_ABORT("checkpoint size mismatch: expected %zu, got %zu\n", data_tgt.size(), n);
+-    }
++    return n == data_tgt.size();
+ }
+ 
+-void common_prompt_checkpoint::load_dft(
++bool common_prompt_checkpoint::load_dft(
+         llama_context * ctx,
+         llama_seq_id seq_id,
+         llama_state_seq_flags flags) const {
+     if (ctx == nullptr) {
+-        return;
++        return true;
+     }
+ 
+     if (data_dft.empty()) {
+-        return;
++        return true;
+     }
+ 
+     const size_t n = llama_state_seq_set_data_ext(ctx, data_dft.data(), data_dft.size(), seq_id, flags);
+-    if (n != data_dft.size()) {
+-        GGML_ABORT("checkpoint size mismatch: expected %zu, got %zu\n", data_dft.size(), n);
+-    }
++    return n == data_dft.size();
+ }
+ 
+ void common_prompt_checkpoint::clear_tgt() {
+diff --git a/common/common.h b/common/common.h
+index 2f50d90..1e65ed2 100644
+--- a/common/common.h
++++ b/common/common.h
+@@ -1291,12 +1291,13 @@ struct common_prompt_checkpoint {
+             llama_seq_id seq_id,
+             llama_state_seq_flags flags);
+ 
+-    void load_tgt(
++    // return false if the state could not be restored
++    bool load_tgt(
+             llama_context * ctx,
+             llama_seq_id seq_id,
+             llama_state_seq_flags flags) const;
+ 
+-    void load_dft(
++    bool load_dft(
+             llama_context * ctx,
+             llama_seq_id seq_id,
+             llama_state_seq_flags flags) const;
+diff --git a/common/speculative.cpp b/common/speculative.cpp
+index a7f095a..7038788 100644
+--- a/common/speculative.cpp
++++ b/common/speculative.cpp
+@@ -1515,6 +1515,22 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+         backend_chains.clear();
+     }
+ 
++    bool get_state(llama_seq_id seq_id, std::vector<uint8_t> & data) const override {
++        if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
++            return false;
++        }
++        data.resize((size_t) n_embd * sizeof(float));
++        std::memcpy(data.data(), pending_h[seq_id].data(), data.size());
++        return true;
++    }
++
++    void set_state(llama_seq_id seq_id, const std::vector<uint8_t> & data) override {
++        if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq || data.size() != (size_t) n_embd * sizeof(float)) {
++            return;
++        }
++        std::memcpy(pending_h[seq_id].data(), data.data(), data.size());
++    }
++
+     void begin(llama_seq_id seq_id, const llama_tokens & prompt) override {
+         // reset here rather than per round, or two identical requests differ
+         common_sampler_reset(smpls[seq_id].get());
+@@ -1569,6 +1585,12 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+         const size_t row_bytes = (size_t) n_embd * sizeof(float);
+ 
+         // if kv is shared with target (e.g Gemma4), then we can skip this catch-up decode
++        // Target nextn embeddings are configured unmasked in the constructor.
++        // Synchronize/reorder once, then use the dense rows for both consumers.
++        const bool profile_prefill = n_tokens > 64 && std::getenv("LLM_SERVICE_PROFILE_TRANSFERS");
++        const int64_t profile_start = profile_prefill ? ggml_time_us() : 0;
++        const float * h_tgt = llama_get_embeddings_nextn(ctx_tgt);
++        const int64_t profile_main_ready = profile_prefill ? ggml_time_us() : 0;
+         if (!is_mem_shared) {
+             batch.clear();
+ 
+@@ -1578,8 +1600,6 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+             // i.e. we cannot have seq_id like this: [0, 0, 0, 1, 1, 0, 1, 1]
+             //                                                       ^--- this is a problem
+             // TODO:this is generally true, but would be nice to assert it
+-            const float * h_tgt = llama_get_embeddings_nextn(ctx_tgt);
+-
+             for (int k = 0; k < n_tokens; ++k) {
+                 const llama_seq_id seq_id = batch_in.tokens[k].seq_id;
+ 
+@@ -1624,6 +1644,12 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+             }
+         }
+ 
++        if (profile_prefill) {
++            llama_synchronize(ctx_dft);
++            SPC_INF("mtp_prefill tokens=%d target_wait_ms=%.3f draft_ms=%.3f\n", n_tokens,
++                    (profile_main_ready-profile_start)/1000.0, (ggml_time_us()-profile_main_ready)/1000.0);
++        }
++
+         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+             if (i_batch_end[seq_id] < 0) {
+                 continue;
+@@ -1633,10 +1659,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+             verify_h_rows[seq_id] = n_rows;
+             verify_h[seq_id].resize((size_t) n_rows * n_embd);
+ 
+-            for (int32_t i = 0; i < n_rows; ++i) {
+-                const float * h = llama_get_embeddings_nextn_ith(ctx_tgt, i_batch_beg[seq_id] + i);
+-                std::memcpy(verify_h[seq_id].data() + (size_t) i * n_embd, h, row_bytes);
+-            }
++            std::memcpy(verify_h[seq_id].data(),
++                    h_tgt + (size_t) i_batch_beg[seq_id] * n_embd, (size_t) n_rows * row_bytes);
+ 
+             std::memcpy(pending_h[seq_id].data(),
+                     verify_h[seq_id].data() + (size_t) (n_rows - 1) * n_embd, row_bytes);
+@@ -2605,6 +2629,14 @@ common_speculative_init_result::common_speculative_init_result(
+ 
+     if (spec_mtp) {
+         cparams.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
++        if (const char * value = std::getenv("LLM_SERVICE_MTP_UBATCH")) {
++            char * end = nullptr;
++            const long count = std::strtol(value, &end, 10);
++            if (end == value || *end != '\0' || count < 1 || count > cparams.n_batch) {
++                throw std::invalid_argument("Invalid LLM_SERVICE_MTP_UBATCH");
++            }
++            cparams.n_ubatch = (uint32_t) count;
++        }
+     }
+ 
+     // the draft context holds as many tokens per sequence as the target context
+diff --git a/examples/speculative-simple/speculative-simple.cpp b/examples/speculative-simple/speculative-simple.cpp
+index 08a1f2a..e4a878b 100644
+--- a/examples/speculative-simple/speculative-simple.cpp
++++ b/examples/speculative-simple/speculative-simple.cpp
+@@ -206,7 +206,7 @@ int main(int argc, char ** argv) {
+             // reset the draft context to the checkpoint before verification
+             if (ctx_dft) {
+                 if (use_ckpt_dft) {
+-                    ckpt.load_dft(ctx_dft, seq_id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
++                    GGML_ASSERT(ckpt.load_dft(ctx_dft, seq_id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY));
+                 }
+ 
+                 llama_memory_seq_rm(llama_get_memory(ctx_dft), seq_id, ckpt.pos_max + 1, -1);
+@@ -269,13 +269,13 @@ int main(int argc, char ** argv) {
+             draft = std::move(ids);
+ 
+             {
+-                ckpt.load_tgt(ctx_tgt, seq_id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
++                GGML_ASSERT(ckpt.load_tgt(ctx_tgt, seq_id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY));
+ 
+                 llama_memory_seq_rm(llama_get_memory(ctx_tgt), seq_id, ckpt.pos_max + 1, -1);
+             }
+ 
+             if (ctx_dft) {
+-                ckpt.load_dft(ctx_dft, seq_id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
++                GGML_ASSERT(ckpt.load_dft(ctx_dft, seq_id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY));
+ 
+                 llama_memory_seq_rm(llama_get_memory(ctx_dft), seq_id, ckpt.pos_max + 1, -1);
+             }
+diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
+index 5bdade6..ca93590 100644
+--- a/ggml/src/ggml-backend.cpp
++++ b/ggml/src/ggml-backend.cpp
+@@ -1939,13 +1939,24 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+                     // try async copy, but if not possible, we can still use a sync copy without synchronizing the dst backend, since we handle the synchronization here with multiple copies and events
+                     // TODO: add public function to facilitate this, since applications do not have direct access to the backend interface
+                     if (!split_backend->iface.cpy_tensor_async || !split_backend->iface.cpy_tensor_async(input_backend, split_backend, input, input_cpy)) {
++                        static const bool profile_transfers = getenv("LLM_SERVICE_PROFILE_TRANSFERS") != nullptr;
++                        const bool profile_this = profile_transfers && input_backend != split_backend &&
++                            ggml_backend_dev_type(ggml_backend_get_device(input_backend)) == GGML_BACKEND_DEVICE_TYPE_GPU &&
++                            ggml_backend_dev_type(ggml_backend_get_device(split_backend)) == GGML_BACKEND_DEVICE_TYPE_GPU;
++                        const int64_t wait_start = profile_this ? ggml_time_us() : 0;
+                         ggml_backend_synchronize(input_backend);
+                         if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
+                             ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
+                         } else {
+                             ggml_backend_synchronize(split_backend);
+                         }
++                        const int64_t copy_start = profile_this ? ggml_time_us() : 0;
+                         ggml_backend_tensor_copy(input, input_cpy);
++                        if (profile_this) {
++                            GGML_LOG_INFO("llm_service_transfer src=%s dst=%s bytes=%zu wait_us=%lld copy_us=%lld\n",
++                                ggml_backend_name(input_backend), ggml_backend_name(split_backend), ggml_nbytes(input),
++                                (long long) (copy_start - wait_start), (long long) (ggml_time_us() - copy_start));
++                        }
+                     }
+                 }
+             }
+diff --git a/ggml/src/ggml-cuda/fattn-vec.cuh b/ggml/src/ggml-cuda/fattn-vec.cuh
+index 57a2855..144515a 100644
+--- a/ggml/src/ggml-cuda/fattn-vec.cuh
++++ b/ggml/src/ggml-cuda/fattn-vec.cuh
+@@ -79,7 +79,8 @@ static __global__ void flash_attn_ext_vec(
+ #endif // RDNA
+     constexpr int nthreads_V_q  = (D/4 < 32 ? D/4 : 32);
+ #else
+-    constexpr int nthreads_KQ_q = (D/4 < 32 ? D/4 : 32);
++    // Measured reduction width for Q5_1 attention at head dimension 256.
++    constexpr int nthreads_KQ_q = (D == 256 && type_K == GGML_TYPE_Q5_1) ? 16 : (D/4 < 32 ? D/4 : 32);
+     constexpr int nthreads_V_q  = (D/4 < 32 ? D/4 : 32);
+ #endif // GGML_USE_HIP
+ 
+@@ -549,6 +550,13 @@ void ggml_cuda_flash_attn_ext_vec_case(ggml_backend_cuda_context & ctx, ggml_ten
+     float logit_softcap;
+     memcpy(&logit_softcap, (const float *) KQV->op_params + 2, sizeof(float));
+ 
++    if constexpr (D == 256 && ((type_K == GGML_TYPE_Q5_1 && type_V == GGML_TYPE_Q5_1) || (type_K == GGML_TYPE_Q8_0 && type_V == GGML_TYPE_Q8_0))) {
++        if (Q->ne[1] == 6 && logit_softcap == 0.0f) {
++            ggml_cuda_flash_attn_ext_vec_case_impl<D, 6, type_K, type_V, false>(ctx, dst);
++            return;
++        }
++    }
++
+     if (Q->ne[1] == 1) {
+         constexpr int cols_per_block = 1;
+         if (logit_softcap == 0.0f) {
+diff --git a/ggml/src/ggml-cuda/fattn.cu b/ggml/src/ggml-cuda/fattn.cu
+index bb34e01..5ba14e4 100644
+--- a/ggml/src/ggml-cuda/fattn.cu
++++ b/ggml/src/ggml-cuda/fattn.cu
+@@ -1,4 +1,5 @@
+ #include "common.cuh"
++#include "cpy.cuh"
+ #include "fattn-common.cuh"
+ #include "fattn-mma-f16.cuh"
+ #include "fattn-tile.cuh"
+@@ -757,6 +758,61 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
+ 
+ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+     ggml_cuda_set_device(ctx.device);
++    static const int pack_gqa = [] {
++        const char * value = getenv("GGML_CUDA_FA_GQA_PACK");
++        const int parsed = value ? atoi(value) : 0;
++        return parsed == 1 ? 2 : parsed;
++    }();
++    const ggml_tensor * q = dst->src[0];
++    const ggml_tensor * k = dst->src[1];
++    const ggml_tensor * v = dst->src[2];
++    const ggml_tensor * mask = dst->src[3];
++    float max_bias, softcap;
++    memcpy(&max_bias, (const float *) dst->op_params + 1, sizeof(float));
++    memcpy(&softcap, (const float *) dst->op_params + 2, sizeof(float));
++    // Decode-only GQA regrouping: adjacent query heads share K/V loads in the
++    // existing vector kernel template. No attention values are dropped.
++    if ((pack_gqa == 2 || pack_gqa == 6) && q->type == GGML_TYPE_F32 && q->ne[0] == 256 && q->ne[1] == 1 && q->ne[3] == 1 &&
++            q->nb[0] == sizeof(float) && ((k->type == GGML_TYPE_Q5_1 && v->type == GGML_TYPE_Q5_1) || (k->type == GGML_TYPE_Q8_0 && v->type == GGML_TYPE_Q8_0)) &&
++            k->ne[1] >= 32768 && k->ne[1] % FATTN_KQ_STRIDE == 0 &&
++            q->ne[2] % (pack_gqa*k->ne[2]) == 0 && mask && mask->type == GGML_TYPE_F16 &&
++            mask->nb[0] == sizeof(ggml_fp16_t) && mask->ne[2] == 1 && mask->ne[3] == 1 &&
++            dst->src[4] == nullptr && max_bias == 0.0f && softcap == 0.0f && ggml_is_contiguous(dst)) {
++        ggml_tensor q_grouped = *q;
++        q_grouped.ne[1] = pack_gqa;
++        q_grouped.ne[2] /= pack_gqa;
++        q_grouped.nb[1] = q->nb[2];
++        q_grouped.nb[2] = pack_gqa*q->nb[2];
++        ggml_cuda_pool_alloc<ggml_fp16_t> mask_data(ctx.pool());
++        mask_data.alloc(pack_gqa*mask->ne[0]);
++        const size_t mask_bytes = mask->ne[0]*sizeof(ggml_fp16_t);
++        for (int i = 0; i < pack_gqa; ++i) {
++            CUDA_CHECK(cudaMemcpyAsync(mask_data.ptr + i*mask->ne[0], mask->data,
++                mask_bytes, cudaMemcpyDeviceToDevice, ctx.stream()));
++        }
++        ggml_tensor mask_grouped = *mask;
++        mask_grouped.ne[1] = pack_gqa;
++        mask_grouped.nb[1] = mask_bytes;
++        mask_grouped.nb[2] = mask_grouped.nb[3] = pack_gqa*mask_bytes;
++        mask_grouped.data = mask_data.ptr;
++        ggml_cuda_pool_alloc<float> output_data(ctx.pool());
++        output_data.alloc(ggml_nelements(dst));
++        ggml_tensor grouped = *dst;
++        grouped.ne[1] /= pack_gqa;
++        grouped.ne[2] = pack_gqa;
++        grouped.nb[0] = sizeof(float);
++        for (int i = 1; i < GGML_MAX_DIMS; ++i) grouped.nb[i] = grouped.nb[i-1]*grouped.ne[i-1];
++        grouped.data = output_data.ptr;
++        grouped.src[0] = &q_grouped;
++        grouped.src[3] = &mask_grouped;
++        ggml_cuda_flash_attn_ext_vec(ctx, &grouped);
++        // Restore original head order using the existing strided-copy kernel.
++        ggml_tensor reordered = grouped;
++        std::swap(reordered.ne[1], reordered.ne[2]);
++        std::swap(reordered.nb[1], reordered.nb[2]);
++        ggml_cuda_cpy(ctx, &reordered, dst);
++        return;
++    }
+     switch (ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst)) {
+         case BEST_FATTN_KERNEL_NONE:
+             GGML_ABORT("fatal error");
+diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+index 5587dfc..19dbd4d 100644
+--- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
++++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+@@ -13085,9 +13085,31 @@ static const char * ggml_backend_vk_host_buffer_type_name(ggml_backend_buffer_ty
+     UNUSED(buft);
+ }
+ 
++// A mixed CUDA/Vulkan deployment may use Vulkan1 while Vulkan0 is idle.
++// Pin host outputs on the selected Vulkan device so async readback can find
++// them in that device's host allocation registry instead of synchronizing
++// through a staging buffer on every prefill microbatch.
++static size_t ggml_vk_host_device_index() {
++    static const size_t index = []() -> size_t {
++        ggml_vk_instance_init();
++        const char * value = std::getenv("GGML_VK_HOST_DEVICE");
++        if (!value) {
++            return 0;
++        }
++        char * end = nullptr;
++        const long parsed = std::strtol(value, &end, 10);
++        if (end == value || *end != '\0' || parsed < 0 || (size_t) parsed >= vk_instance.device_indices.size()) {
++            GGML_ABORT("Invalid GGML_VK_HOST_DEVICE");
++        }
++        GGML_LOG_INFO("ggml_vulkan: host buffers use Vulkan%ld\n", parsed);
++        return (size_t) parsed;
++    }();
++    return index;
++}
++
+ static void ggml_backend_vk_host_buffer_free_buffer(ggml_backend_buffer_t buffer) {
+     VK_LOG_MEMORY("ggml_backend_vk_host_buffer_free_buffer()");
+-    ggml_vk_host_free(vk_instance.devices[0], buffer->context);
++    ggml_vk_host_free(vk_instance.devices[ggml_vk_host_device_index()], buffer->context);
+ }
+ 
+ static ggml_backend_buffer_t ggml_backend_vk_host_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
+@@ -13096,7 +13118,7 @@ static ggml_backend_buffer_t ggml_backend_vk_host_buffer_type_alloc_buffer(ggml_
+     size += 32;  // Behave like the CPU buffer type
+     void * ptr = nullptr;
+     try {
+-        ptr = ggml_vk_host_malloc(vk_instance.devices[0], size);
++        ptr = ggml_vk_host_malloc(vk_instance.devices[ggml_vk_host_device_index()], size);
+     } catch (vk::SystemError& e) {
+         GGML_LOG_WARN("ggml_vulkan: Failed to allocate pinned memory (%s)\n", e.what());
+         // fallback to cpu buffer
+@@ -13113,18 +13135,21 @@ static ggml_backend_buffer_t ggml_backend_vk_host_buffer_type_alloc_buffer(ggml_
+ }
+ 
+ static size_t ggml_backend_vk_host_buffer_type_get_alignment(ggml_backend_buffer_type_t buft) {
+-    return vk_instance.devices[0]->properties.limits.minMemoryMapAlignment;
++    return vk_instance.devices[ggml_vk_host_device_index()]->properties.limits.minMemoryMapAlignment;
+ 
+     UNUSED(buft);
+ }
+ 
+ static size_t ggml_backend_vk_host_buffer_type_get_max_size(ggml_backend_buffer_type_t buft) {
+-    return vk_instance.devices[0]->suballocation_block_size;
++    return vk_instance.devices[ggml_vk_host_device_index()]->suballocation_block_size;
+ 
+     UNUSED(buft);
+ }
+ 
+ ggml_backend_buffer_type_t ggml_backend_vk_host_buffer_type() {
++    ggml_vk_instance_init();
++    const size_t host_index = ggml_vk_host_device_index();
++    ggml_vk_get_device(host_index);
+     static struct ggml_backend_buffer_type ggml_backend_vk_buffer_type_host = {
+         /* .iface    = */ {
+             /* .get_name            = */ ggml_backend_vk_host_buffer_type_name,
+@@ -13136,14 +13161,10 @@ ggml_backend_buffer_type_t ggml_backend_vk_host_buffer_type() {
+             /* .get_alloc_size_n    = */ NULL,
+             /* .is_host             = */ ggml_backend_cpu_buffer_type()->iface.is_host,
+         },
+-        /* .device   = */ ggml_backend_reg_dev_get(ggml_backend_vk_reg(), 0),
++        /* .device   = */ ggml_backend_reg_dev_get(ggml_backend_vk_reg(), host_index),
+         /* .context  = */ nullptr,
+     };
+ 
+-    // Make sure device 0 is initialized
+-    ggml_vk_instance_init();
+-    ggml_vk_get_device(0);
+-
+     return &ggml_backend_vk_buffer_type_host;
+ }
+ 
+@@ -14217,6 +14238,9 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
+ 
+     vk_context compute_ctx;
+     if (vk_perf_logger_enabled) {
++        // Profiling owns and resets one timestamp pool. Drain uploads / event
++        // command buffers left by the async scheduler before starting a sample.
++        ggml_vk_synchronize(ctx);
+         // allocate/resize the query pool
+         if (ctx->num_queries < cgraph->n_nodes + 1) {
+             if (ctx->query_pool) {
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 07b4c61..7eece9d 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -436,6 +436,12 @@ llama_context::llama_context(
+             cparams.offload_kqv &&
+             !model.has_tensor_overrides();
+ 
++        // An MTP head placed on one device does not need the target model's
++        // multi-device pipeline buffers. Keep this opt-in for other placements.
++        if (cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP && std::getenv("LLM_SERVICE_MTP_NO_PIPELINE")) {
++            pipeline_parallel = false;
++        }
++
+         // pipeline parallelism requires support for async compute and events in all devices
+         if (pipeline_parallel) {
+             for (auto & backend : backends) {
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+index 97e0cee..e2abab4 100644
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -1593,12 +1593,12 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+     auto get_layer_buft_list = [&](int il) -> llama_model::impl::layer_dev {
+         const bool is_swa = il < n_layer_all && hparams.is_swa(il);
+         if (il < i_gpu_start || (il - i_gpu_start) >= act_gpu_layers) {
+-            LLAMA_LOG_DEBUG("load_tensors: layer %3d assigned to device %s, is_swa = %d\n", il, ggml_backend_dev_name(cpu_dev), is_swa);
++            LLAMA_LOG_INFO("load_tensors: layer %3d assigned to device %s, is_swa = %d\n", il, ggml_backend_dev_name(cpu_dev), is_swa);
+             return {cpu_dev, &pimpl->cpu_buft_list};
+         }
+         const int layer_gpu = std::upper_bound(splits.begin(), splits.begin() + n_devices(), float(il - i_gpu_start)/act_gpu_layers) - splits.begin();
+         auto * dev = devices.at(layer_gpu).dev;
+-        LLAMA_LOG_DEBUG("load_tensors: layer %3d assigned to device %s, is_swa = %d\n", il, ggml_backend_dev_name(dev), is_swa);
++        LLAMA_LOG_INFO("load_tensors: layer %3d assigned to device %s, is_swa = %d\n", il, ggml_backend_dev_name(dev), is_swa);
+         return {dev, &pimpl->gpu_buft_list.at(dev)};
+     };
+ 
+diff --git a/src/models/qwen35.cpp b/src/models/qwen35.cpp
+index ab98744..876b074 100644
+--- a/src/models/qwen35.cpp
++++ b/src/models/qwen35.cpp
+@@ -1,5 +1,6 @@
+ #include "models.h"
+ #include "llama-memory-recurrent.h"
++#include "llama-kv-cache.h"
+ 
+ void llama_model_qwen35::load_arch_hparams(llama_model_loader & ml) {
+     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS,       hparams.f_norm_rms_eps);
+@@ -547,8 +548,10 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
+ 
+     res->add_input(std::move(inp));
+ 
++    const bool kv_only = n_outputs == 0 && cparams.embeddings_nextn_masked &&
++        !cparams.training && std::getenv("LLM_SERVICE_MTP_KV_ONLY");
+     ggml_tensor * inp_pos     = build_inp_pos();
+-    ggml_tensor * inp_out_ids = build_inp_out_ids();
++    ggml_tensor * inp_out_ids = kv_only ? nullptr : build_inp_out_ids();
+ 
+     auto * inp_attn = build_attn_inp_kv();
+ 
+@@ -606,6 +609,21 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
+             n_rot, sections, rope_type, n_ctx_orig, freq_base, freq_scale,
+             ext_factor, attn_factor, beta_fast, beta_slow);
+ 
++    if (kv_only) {
++        // Catch-up has no sampled outputs: this single dense MTP block only
++        // needs its K/V projections. Attention, output projection and FFN do
++        // not contribute to its cache. Preserve the usual cache rotations.
++        if (inp_attn->self_k_rot) {
++            Kcur = llama_mul_mat_hadamard(ctx0, Kcur, inp_attn->self_k_rot);
++        }
++        if (inp_attn->self_v_rot) {
++            Vcur = llama_mul_mat_hadamard(ctx0, Vcur, inp_attn->self_v_rot);
++        }
++        ggml_build_forward_expand(gf, inp_attn->mctx->cpy_k(ctx0, Kcur, inp_attn->get_k_idxs(), il));
++        ggml_build_forward_expand(gf, inp_attn->mctx->cpy_v(ctx0, Vcur, inp_attn->get_v_idxs(), il));
++        return;
++    }
++
+     const float kq_scale = hparams.f_attention_scale == 0.0f
+             ? 1.0f / sqrtf(float(n_embd_head)) : hparams.f_attention_scale;
+ 
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index d889302..e933338 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -9327,6 +9327,24 @@ static const ggml_type other_types[] = {
+ // Test cases for evaluation: should try to cover edge cases while using small input sizes to keep the runtime low
+ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+     std::vector<std::unique_ptr<test_case>> test_cases;
++    if (getenv("LLM_SERVICE_FATTN_TEST")) {
++        const ggml_type kv_type = getenv("LLM_SERVICE_FATTN_Q8") ? GGML_TYPE_Q8_0 : GGML_TYPE_Q5_1;
++        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 512, 256,
++            true, false, 0, 0, GGML_PREC_F32, kv_type, kv_type));
++        for (int kv : {512, 4096}) {
++            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, 65,
++                true, false, 0, 0, GGML_PREC_F32, kv_type, kv_type));
++        }
++        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 4096, 256,
++            true, false, 0, 0, GGML_PREC_F32, kv_type, kv_type));
++        for (int kv : {512, 4096, 65536}) {
++            for (int nb : {1, 2}) {
++                test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, nb,
++                    true, false, 0, 0, GGML_PREC_F32, kv_type, kv_type));
++            }
++        }
++        return test_cases;
++    }
+     std::default_random_engine rng(0);
+ 
+     // unary ops
+@@ -11600,6 +11618,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+ // Test cases for performance evaluation: should be representative of real-world use cases
+ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+     std::vector<std::unique_ptr<test_case>> test_cases;
++    if (getenv("LLM_SERVICE_FATTN_TEST")) {
++        const ggml_type kv_type = getenv("LLM_SERVICE_FATTN_Q8") ? GGML_TYPE_Q8_0 : GGML_TYPE_Q5_1;
++        for (int nb : {1, 256, 512, 1024}) {
++            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 147456, nb,
++                true, false, 0, 0, GGML_PREC_F32, kv_type, kv_type));
++        }
++        return test_cases;
++    }
+ 
+     // SWIGLU at a 27B-class FFN width, fused [gate|up] vs split operands
+     // note: same bytes either way, so a backend that indexes them differently shows it here
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index d1af984..a6b1e04 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -20,6 +20,7 @@
+ 
+ #include <algorithm>
+ #include <cstddef>
++#include <cstdlib>
+ #include <cinttypes>
+ #include <exception>
+ #include <memory>
+@@ -243,6 +244,7 @@ struct server_batch {
+ };
+ 
+ struct server_slot {
++    int64_t reusable_checkpoint_n_tokens = -1;
+     int id;
+ 
+     llama_context * ctx_tgt = nullptr;
+@@ -2512,6 +2514,25 @@ private:
+     // n_tokens_cur: the number of tokens added to the batch for the current slot
+     void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max) {
+         const int id_task = slot.task->id;
++        const int64_t n_tokens_new = slot.prompt.n_tokens() - n_tokens_cur;
++        if (!std::getenv("LLM_SERVICE_DISABLE_CHECKPOINT_REUSE") &&
++                slot.stats.n_prompt_processed == 0 && n_tokens_new == slot.reusable_checkpoint_n_tokens) {
++            for (auto & cur : slot.prompt.checkpoints) {
++                if (cur.n_tokens == n_tokens_new && cur.pos_min == pos_min && cur.pos_max == pos_max) {
++                    if (ctx_dft) {
++                        std::vector<uint8_t> current_spec;
++                        if (cur.data_dft.empty() || cur.data_spec.empty() ||
++                                !common_speculative_get_state(spec.get(), slot.id, current_spec) || current_spec != cur.data_spec) {
++                            continue;
++                        }
++                    }
++                    cur.id_task = id_task;
++                    slot.reusable_checkpoint_n_tokens = -1;
++                    SLT_TRC(slot, "reused just-restored context checkpoint at n_tokens = %" PRId64 "\n", n_tokens_new);
++                    return;
++                }
++            }
++        }
+ 
+         // evict checkpoints within min-step of a previous checkpoint, unless they were
+         // created by the current task
+@@ -2575,6 +2596,159 @@ private:
+                 cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024);
+     }
+ 
++    // checkpoints are appended to the slot save file, after the llama state payload
++    // they cannot be recreated from the final state alone (a recurrent state cannot be rewound)
++    static constexpr uint32_t SLOT_CKPT_MAGIC   = 0x504b4353; // "SCKP"
++    static constexpr uint32_t SLOT_CKPT_VERSION = 1;
++
++    static bool ckpt_read(std::ifstream & ifs, void * dst, size_t size, size_t & n_read) {
++        if (!ifs.read((char *) dst, size)) {
++            return false;
++        }
++        n_read += size;
++        return true;
++    }
++
++    static bool ckpt_read_buf(std::ifstream & ifs, std::vector<uint8_t> & buf, size_t n_avail, size_t & n_read) {
++        uint64_t n = 0;
++        // check the size against the bytes left in the file before allocating, the size field may be corrupted
++        if (!ckpt_read(ifs, &n, sizeof(n), n_read) || n > n_avail - n_read) {
++            return false;
++        }
++        buf.resize(n);
++        return n == 0 || ckpt_read(ifs, buf.data(), n, n_read);
++    }
++
++    static void ckpt_write(std::ofstream & ofs, const void * src, size_t size, size_t & n_written) {
++        ofs.write((const char *) src, size);
++        n_written += size;
++    }
++
++    static void ckpt_write_buf(std::ofstream & ofs, const std::vector<uint8_t> & buf, size_t & n_written) {
++        const uint64_t n = buf.size();
++        ckpt_write(ofs, &n, sizeof(n), n_written);
++        if (n > 0) {
++            ckpt_write(ofs, buf.data(), n, n_written);
++        }
++    }
++
++    // returns false if the appendix could not be written completely
++    bool save_slot_checkpoints(const std::string & filepath, const server_slot & slot, size_t & n_written) const {
++        n_written = 0;
++        if (slot.prompt.checkpoints.empty() && ctx_dft == nullptr) {
++            return true;
++        }
++        std::ofstream ofs(std::filesystem::u8path(filepath), std::ios::binary | std::ios::app);
++        if (!ofs) {
++            SLT_WRN(slot, "failed to append context checkpoints to '%s'\n", filepath.c_str());
++            return false;
++        }
++        const uint32_t magic   = SLOT_CKPT_MAGIC;
++        const uint32_t version = ctx_dft ? 2 : SLOT_CKPT_VERSION;
++        const uint32_t count   = (uint32_t) slot.prompt.checkpoints.size();
++        ckpt_write(ofs, &magic,   sizeof(magic),   n_written);
++        ckpt_write(ofs, &version, sizeof(version), n_written);
++        ckpt_write(ofs, &count,   sizeof(count),   n_written);
++        if (ctx_dft) {
++            common_prompt_checkpoint current;
++            current.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_NONE);
++            common_speculative_get_state(spec.get(), slot.id, current.data_spec);
++            ckpt_write_buf(ofs, current.data_dft, n_written);
++            ckpt_write_buf(ofs, current.data_spec, n_written);
++        }
++        for (const auto & cur : slot.prompt.checkpoints) {
++            ckpt_write(ofs, &cur.n_tokens, sizeof(cur.n_tokens), n_written);
++            ckpt_write(ofs, &cur.pos_min,  sizeof(cur.pos_min),  n_written);
++            ckpt_write(ofs, &cur.pos_max,  sizeof(cur.pos_max),  n_written);
++            ckpt_write_buf(ofs, cur.data_tgt,  n_written);
++            ckpt_write_buf(ofs, cur.data_dft,  n_written);
++            ckpt_write_buf(ofs, cur.data_spec, n_written);
++        }
++        ofs.flush();
++        if (!ofs) {
++            SLT_WRN(slot, "failed to append context checkpoints to '%s' - the appendix is incomplete\n", filepath.c_str());
++            return false;
++        }
++        SLT_INF(slot, "appended %u context checkpoint(s) (%.3f MiB) to '%s'\n",
++                count, (float) n_written / 1024 / 1024, filepath.c_str());
++        return true;
++    }
++
++    // returns the number of bytes consumed, 0 if there is no usable appendix
++    size_t load_slot_checkpoints(const std::string & filepath, size_t offset, server_slot & slot) const {
++        std::ifstream ifs(std::filesystem::u8path(filepath), std::ios::binary | std::ios::ate);
++        const size_t file_size = ifs ? (size_t) ifs.tellg() : 0;
++        if (!ifs || file_size < offset || !ifs.seekg(offset)) {
++            return 0;
++        }
++        const size_t n_avail = file_size - offset; // bytes after the llama state payload
++        size_t n_read = 0;
++        uint32_t magic   = 0;
++        uint32_t version = 0;
++        uint32_t count   = 0;
++        if (!ckpt_read(ifs, &magic, sizeof(magic), n_read) || magic != SLOT_CKPT_MAGIC) {
++            return 0;
++        }
++        if (!ckpt_read(ifs, &version, sizeof(version), n_read) || (version != SLOT_CKPT_VERSION && version != 2) ||
++            !ckpt_read(ifs, &count,   sizeof(count),   n_read)) {
++            SLT_WRN(slot, "invalid context checkpoint appendix in '%s' - ignored\n", filepath.c_str());
++            return 0;
++        }
++        common_prompt_checkpoint current;
++        if (version == 2 && (!ckpt_read_buf(ifs, current.data_dft, n_avail, n_read) ||
++                            !ckpt_read_buf(ifs, current.data_spec, n_avail, n_read))) {
++            return 0;
++        }
++        if (ctx_dft && current.data_dft.empty()) {
++            SLT_WRN(slot, "%s", "slot snapshot has no complete draft state\n");
++            return 0;
++        }
++        std::list<common_prompt_checkpoint> checkpoints;
++        for (uint32_t i = 0; i < count; ++i) {
++            common_prompt_checkpoint cur;
++            cur.id_task = -1; // not created by a task - marks a checkpoint restored from a slot file
++            if (!ckpt_read(ifs, &cur.n_tokens, sizeof(cur.n_tokens), n_read) ||
++                !ckpt_read(ifs, &cur.pos_min,  sizeof(cur.pos_min),  n_read) ||
++                !ckpt_read(ifs, &cur.pos_max,  sizeof(cur.pos_max),  n_read) ||
++                !ckpt_read_buf(ifs, cur.data_tgt,  n_avail, n_read) ||
++                !ckpt_read_buf(ifs, cur.data_dft,  n_avail, n_read) ||
++                !ckpt_read_buf(ifs, cur.data_spec, n_avail, n_read)) {
++                SLT_WRN(slot, "truncated context checkpoint appendix in '%s' - ignored\n", filepath.c_str());
++                return 0;
++            }
++            // a saved checkpoint always holds a target state - an empty blob would roll back without restoring anything
++            if (cur.data_tgt.empty()) {
++                SLT_WRN(slot, "invalid context checkpoint appendix in '%s' - ignored\n", filepath.c_str());
++                return 0;
++            }
++            checkpoints.push_back(std::move(cur));
++            if (checkpoints.size() > (size_t) params_base.n_ctx_checkpoints) {
++                checkpoints.pop_front();
++            }
++        }
++        // the slot file does not check the draft context - test-load one draft checkpoint, drop the draft data if it does not fit
++        if (ctx_dft != nullptr && !checkpoints.empty() && !checkpoints.back().data_dft.empty()) {
++            const bool ok = checkpoints.back().load_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
++            llama_memory_seq_rm(llama_get_memory(ctx_dft), slot.id, -1, -1);
++            if (!ok) {
++                SLT_WRN(slot, "draft context checkpoint data in '%s' does not match the draft context - dropped\n", filepath.c_str());
++                for (auto & cur : checkpoints) {
++                    cur.clear_dft();
++                }
++            }
++        }
++        if (ctx_dft) {
++            if (!current.load_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_NONE)) {
++                return 0;
++            }
++            common_speculative_set_state(spec.get(), slot.id, current.data_spec);
++            SLT_INF(slot, "restored full draft state (%zu bytes)\n", current.data_dft.size());
++        }
++        slot.prompt.checkpoints = std::move(checkpoints);
++        SLT_INF(slot, "restored %zu context checkpoint(s) from '%s'\n", slot.prompt.checkpoints.size(), filepath.c_str());
++        return n_read;
++    }
++
+     // returns false to decline the task, it is offered again after the decode is done
+     bool process_single_task(server_task && task, bool is_yielding) {
+         // while yielding, an encode / decode is running and only reading the server state is safe
+@@ -2784,6 +2958,12 @@ private:
+                         break;
+                     }
+ 
++                    size_t nwrite_ckpt = 0;
++                    if (!save_slot_checkpoints(filepath, *slot, nwrite_ckpt)) {
++                        send_error(task, "Unable to save slot: incomplete context checkpoints", ERROR_TYPE_SERVER);
++                        break;
++                    }
++
+                     const int64_t t_end = ggml_time_us();
+                     const double t_save_ms = (t_end - t_start) / 1000.0;
+ 
+@@ -2793,7 +2973,7 @@ private:
+                     res->filename = filename;
+                     res->is_save  = true;
+                     res->n_tokens = slot->prompt.tokens.size();
+-                    res->n_bytes  = nwrite;
++                    res->n_bytes  = nwrite + nwrite_ckpt;
+                     res->t_ms     = t_save_ms;
+                     queue_results.send(std::move(res));
+                 } break;
+@@ -2849,6 +3029,14 @@ private:
+                         break;
+                     }
+ 
++                    // nread is the end offset of the llama state payload within the file
++                    const size_t nread_ckpt = load_slot_checkpoints(filepath, nread, *slot);
++                    if (ctx_dft && nread_ckpt == 0) {
++                        slot->prompt_clear();
++                        send_error(task, "Unable to restore complete draft state", ERROR_TYPE_SERVER);
++                        break;
++                    }
++
+                     const int64_t t_end = ggml_time_us();
+                     const double t_restore_ms = (t_end - t_start) / 1000.0;
+ 
+@@ -2858,7 +3046,7 @@ private:
+                     res->filename = filename;
+                     res->is_save  = false;
+                     res->n_tokens = slot->prompt.tokens.size();
+-                    res->n_bytes  = nread;
++                    res->n_bytes  = nread + nread_ckpt;
+                     res->t_ms     = t_restore_ms;
+                     queue_results.send(std::move(res));
+                 } break;
+@@ -3270,7 +3458,7 @@ private:
+ 
+             if (ctx_dft) {
+                 if (use_ckpt_dft) {
+-                    ckpt.load_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
++                    GGML_ASSERT(ckpt.load_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY));
+                 }
+ 
+                 if (!llama_memory_seq_rm(llama_get_memory(ctx_dft), slot.id, ckpt.pos_max + 1, -1)) {
+@@ -3351,6 +3539,7 @@ private:
+ 
+                     // TODO: maybe move branch to outside of this loop in the future
+                     if (slot.state == SLOT_STATE_STARTED) {
++                        slot.reusable_checkpoint_n_tokens = -1;
+                         slot.stats.update_prompt_start();
+ 
+                         slot.state = SLOT_STATE_PROCESSING_PROMPT;
+@@ -3596,13 +3785,26 @@ private:
+ 
+                                     if (!do_reset) {
+                                         // restore the context checkpoint
+-                                        it->load_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+-                                        it->load_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
++                                        if (!it->load_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) ||
++                                            !it->load_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY)) {
++                                            if (it->id_task != -1) {
++                                                GGML_ABORT("failed to restore context checkpoint\n");
++                                            }
++                                            // restored from a slot file, not guaranteed to load - fall back to full prompt re-processing
++                                            SLT_WRN(slot, "%s", "failed to load context checkpoint restored from a slot file\n");
++                                            do_reset = true;
++                                        }
++                                    }
++
++                                    if (!do_reset) {
+                                         // restore the draft's speculative state
+                                         common_speculative_set_state(spec.get(), slot.id, it->data_spec);
+ 
+                                         pos_next = std::min(pos_next, std::max(it->pos_min + 1, it->pos_max));
+                                         n_past   = std::min(slot.prompt.tokens.size_up_to_pos(pos_next), (size_t) it->n_tokens);
++                                        if (n_past == it->n_tokens) {
++                                            slot.reusable_checkpoint_n_tokens = it->n_tokens;
++                                        }
+                                         SLT_TRC(slot, "restored context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_past = %d, size = %.3f MiB)\n", it->pos_min, it->pos_max, it->n_tokens, n_past, (float) it->size() / 1024 / 1024);
+                                     }
+ 
+@@ -3832,10 +4034,15 @@ private:
+                         //  - 4
+                         // ref: https://github.com/ggml-org/llama.cpp/pull/20288
+                         if (do_checkpoint) {
+-                            static const int checkpoint_offsets[] = {4 + n_ubatch, 4};
++                            // Keep the 4-token boundary when adding the optional exact-replay checkpoint.
++                            static const bool fine_checkpoints = std::getenv("LLM_SERVICE_FINE_CHECKPOINTS") != nullptr;
++                            static const int checkpoint_offsets[] = {4 + n_ubatch, 4, 1};
+ 
+                             bool should_break = false;
+                             for (int offset : checkpoint_offsets) {
++                                if (offset == 1 && !fine_checkpoints) {
++                                    continue;
++                                }
+                                 const int n_last = std::min(n_batch, offset);
+                                 if (slot.task->n_tokens() == slot.prompt.n_tokens() + n_last) {
+                                     should_break = true;
+@@ -4292,10 +4499,10 @@ private:
+ 
+                         SLT_DBG(slot, "restoring speculative checkpoint (pos_min = %d, pos_max = %d, size = %zu)\n", ckpt.pos_min, ckpt.pos_max, ckpt.size());
+ 
+-                        ckpt.load_tgt(slot.ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
++                        GGML_ASSERT(ckpt.load_tgt(slot.ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY));
+ 
+                         if (slot.ctx_dft) {
+-                            ckpt.load_dft(slot.ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
++                            GGML_ASSERT(ckpt.load_dft(slot.ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY));
+                         }
+ 
+                         slot.mem.seq_rm(slot.id, ckpt.pos_max + 1, -1);
+@@ -4605,6 +4812,28 @@ void server_context::set_state_callback(server_state_callback_t callback) {
+ // server_routes
+ //
+ 
++llama_tokens server_routes::tokenize_text_cached(const json & text, bool add_special, bool parse_special) {
++    if (!text.is_string() || std::getenv("LLM_SERVICE_DISABLE_TOKEN_CACHE")) {
++        return tokenize_mixed(ctx_server.vocab, text, add_special, parse_special);
++    }
++    const auto value = text.get<std::string>();
++    if (value.size() > 8*1024*1024) {
++        return tokenize_mixed(ctx_server.vocab, text, add_special, parse_special);
++    }
++    std::lock_guard<std::mutex> guard(token_cache_mutex);
++    if (token_cache_valid && token_cache_add_special == add_special &&
++            token_cache_parse_special == parse_special && token_cache_text == value) {
++        return token_cache_tokens;
++    }
++    auto tokens = tokenize_mixed(ctx_server.vocab, text, add_special, parse_special);
++    token_cache_text = value;
++    token_cache_tokens = tokens;
++    token_cache_add_special = add_special;
++    token_cache_parse_special = parse_special;
++    token_cache_valid = true;
++    return tokens;
++}
++
+ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
+             const server_http_req & req,
+             server_task_type type,
+@@ -4645,6 +4874,8 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
+         if (res_type != TASK_RESPONSE_TYPE_NONE && ctx_server.mctx != nullptr) {
+             // This is the case used by OAI compatible chat path with MTMD. TODO It can be moved to the path below.
+             inputs.push_back(process_mtmd_prompt(ctx_server.mctx, prompt.get<std::string>(), files, ctx_server.init_opt));
++        } else if (ctx_server.mctx == nullptr && prompt.is_string()) {
++            inputs.emplace_back(tokenize_text_cached(prompt, true, true), false);
+         } else {
+             // Everything else, including multimodal completions.
+             inputs = tokenize_input_prompts(ctx_server.vocab, ctx_server.mctx, prompt, true, true, ctx_server.init_opt);
+@@ -5446,7 +5677,7 @@ void server_routes::init_routes() {
+             const bool parse_special = json_value(body, "parse_special", true);
+             const bool with_pieces = json_value(body, "with_pieces", false);
+ 
+-            llama_tokens tokens = tokenize_mixed(ctx_server.vocab, body.at("content"), add_special, parse_special);
++            llama_tokens tokens = tokenize_text_cached(body.at("content"), add_special, parse_special);
+ 
+             if (with_pieces) {
+                 for (const auto& token : tokens) {
+diff --git a/tools/server/server-context.h b/tools/server/server-context.h
+index 7fe0035..6593548 100644
+--- a/tools/server/server-context.h
++++ b/tools/server/server-context.h
+@@ -125,6 +125,9 @@ struct server_routes {
+     // note: this is not thread-safe and can only when ctx_http.is_ready is false
+     void update_meta(const server_context & ctx_server) {
+         this->meta = std::make_unique<server_context_meta>(ctx_server.get_meta());
++        token_cache_valid = false;
++        token_cache_text.clear();
++        token_cache_tokens.clear();
+     }
+ 
+     // handlers using lambda function, so that they can capture `this` without `std::bind`
+@@ -161,6 +164,14 @@ struct server_routes {
+     json get_model_info() const;
+ 
+ private:
++    llama_tokens tokenize_text_cached(const json & text, bool add_special, bool parse_special);
++    std::mutex token_cache_mutex;
++    std::string token_cache_text;
++    llama_tokens token_cache_tokens;
++    bool token_cache_valid = false;
++    bool token_cache_add_special = false;
++    bool token_cache_parse_special = false;
++
+     std::unique_ptr<server_res_generator> handle_completions_impl(
+             const server_http_req & req,
+             server_task_type type,
+diff --git a/tools/server/tests/unit/test_slot_save.py b/tools/server/tests/unit/test_slot_save.py
+index 5eca46c..33bcede 100644
+--- a/tools/server/tests/unit/test_slot_save.py
++++ b/tools/server/tests/unit/test_slot_save.py
+@@ -37,6 +37,8 @@ def test_slot_save_restore():
+     })
+     assert res.status_code == 200
+     assert res.body["n_saved"] == 84
++    slot_file = os.path.join(server.slot_save_path, "slot1.bin")
++    assert res.body["n_written"] == os.path.getsize(slot_file)
+ 
+     # Since we have cache, this should only process the last tokens
+     res = server.make_request("POST", "/completion", data={
+@@ -54,6 +56,7 @@ def test_slot_save_restore():
+     })
+     assert res.status_code == 200
+     assert res.body["n_restored"] == 84
++    assert res.body["n_read"] == os.path.getsize(slot_file)
+ 
+     # Since we have cache, slot 0 should only process the last tokens
+     res = server.make_request("POST", "/completion", data={
+@@ -546,3 +549,243 @@ def test_slot_restore_media_file_without_mmproj(mmproj_server):
+     assert res.status_code == 200
+     assert res.body["timings"]["cache_n"] == 0
+     assert res.body["content"] == content
++
++
++@pytest.fixture
++def swa_server():
++    swa = ServerPreset.tinygemma3()
++    swa.slot_save_path = "./tmp"
++    swa.temperature = 0.0
++    swa.cache_ram = 0
++    # Keep the first prompt checkpoint before the divergence point.
++    swa.n_ubatch = 32
++    return swa
++
++
++# the non-ASCII name checks that the appendix lands in the same file as the llama state on Windows
++@pytest.mark.parametrize("filename", ["ckpt_slot1.bin", "ckpt_slot1_é.bin"])
++def test_slot_restore_preserves_context_checkpoints(swa_server, filename):
++    server = swa_server
++    server.start()
++
++    base = "The quick brown fox jumps over the lazy dog. " * 20
++
++    res = server.make_request("POST", "/completion", data={
++        "prompt": base + "The first result of this test is a valid value.",
++        "id_slot": 1,
++        "cache_prompt": True,
++    })
++    assert res.status_code == 200
++    n_full = res.body["timings"]["prompt_n"]
++
++    res = server.make_request("POST", "/completion", data={
++        "prompt": base + "But the second ending was different and sad.",
++        "id_slot": 1,
++        "cache_prompt": True,
++    })
++    assert res.status_code == 200
++    n_live = res.body["timings"]["prompt_n"]
++    assert n_live < n_full
++
++    res = server.make_request("POST", "/slots/1?action=erase")
++    assert res.status_code == 200
++
++    res = server.make_request("POST", "/completion", data={
++        "prompt": base + "The first result of this test is a valid value.",
++        "id_slot": 1,
++        "cache_prompt": True,
++    })
++    assert res.status_code == 200
++
++    res = server.make_request("POST", "/slots/1?action=save", data={
++        "filename": filename,
++    })
++    assert res.status_code == 200
++    assert res.body["n_saved"] > 0
++    ckpt_file = os.path.join(server.slot_save_path, filename)
++    assert res.body["n_written"] == os.path.getsize(ckpt_file)
++
++    res = server.make_request("POST", "/completion", data={
++        "prompt": "Unrelated text with no common prefix occupies the slot now.",
++        "id_slot": 1,
++        "cache_prompt": True,
++    })
++    assert res.status_code == 200
++
++    res = server.make_request("POST", "/slots/1?action=restore", data={
++        "filename": filename,
++    })
++    assert res.status_code == 200
++    assert res.body["n_read"] == os.path.getsize(ckpt_file)
++
++    res = server.make_request("POST", "/completion", data={
++        "prompt": base + "But the second ending was different and sad.",
++        "id_slot": 1,
++        "cache_prompt": True,
++    })
++    assert res.status_code == 200
++    assert res.body["timings"]["prompt_n"] == n_live
++
++
++# checkpoint appendix: magic(4) version(4) count(4), then per checkpoint
++# n_tokens(8) pos_min(4) pos_max(4) and three blobs (target, draft, speculative), each size(8) + data
++def parse_ckpt_appendix(data):
++    off = data.find(struct.pack("<II", 0x504b4353, 1))
++    assert off > 0
++    count = struct.unpack_from("<I", data, off + 8)[0]
++    ckpts = []
++    pos = off + 12
++    for _ in range(count):
++        start = pos
++        pos += 16
++        blobs = []
++        for _ in range(3):
++            n = struct.unpack_from("<Q", data, pos)[0]
++            blobs.append(pos + 8)
++            pos += 8 + n
++        ckpts.append((start, pos, blobs[0]))
++    assert pos == len(data)
++    return off, ckpts
++
++
++# a damaged appendix must be ignored, or its checkpoints dropped when they fail to load, without aborting the server
++@pytest.mark.parametrize("damage", ["oversized_blob", "empty_target", "corrupt_state", "many_checkpoints"])
++def test_slot_restore_damaged_checkpoint_appendix(swa_server, damage):
++    server = swa_server
++    server.start()
++
++    base = "The quick brown fox jumps over the lazy dog. " * 20
++
++    res = server.make_request("POST", "/completion", data={
++        "prompt": base + "The first result of this test is a valid value.",
++        "id_slot": 1,
++        "cache_prompt": True,
++    })
++    assert res.status_code == 200
++
++    res = server.make_request("POST", "/completion", data={
++        "prompt": base + "But the second ending was different and sad.",
++        "id_slot": 1,
++        "cache_prompt": True,
++    })
++    assert res.status_code == 200
++    n_live = res.body["timings"]["prompt_n"]
++
++    res = server.make_request("POST", "/slots/1?action=erase")
++    assert res.status_code == 200
++
++    res = server.make_request("POST", "/completion", data={
++        "prompt": base + "The first result of this test is a valid value.",
++        "id_slot": 1,
++        "cache_prompt": True,
++    })
++    assert res.status_code == 200
++
++    res = server.make_request("POST", "/slots/1?action=save", data={
++        "filename": "ckpt_damaged.bin",
++    })
++    assert res.status_code == 200
++
++    path = os.path.join(server.slot_save_path, "ckpt_damaged.bin")
++    with open(path, "rb") as f:
++        data = bytearray(f.read())
++    off, ckpts = parse_ckpt_appendix(data)
++
++    if damage == "oversized_blob":
++        # the first target blob declares a size that cannot be allocated, it must be rejected before allocating
++        data = data[:ckpts[0][0] + 16] + struct.pack("<Q", 1 << 62)
++    elif damage == "empty_target":
++        # the target blobs are removed and their size set to 0, a valid save never writes an empty target state
++        for start, end, tgt in reversed(ckpts):
++            size = struct.unpack_from("<Q", data, tgt - 8)[0]
++            data = data[:tgt - 8] + struct.pack("<Q", 0) + data[tgt + size:]
++    elif damage == "corrupt_state":
++        # the sizes are intact, but the target states do not load
++        for _, _, tgt in ckpts:
++            struct.pack_into("<I", data, tgt, 0xdeadbeef)
++    else:
++        # more than 1024 entries: one-byte fillers that never match go first, the real checkpoints stay last
++        filler = struct.pack("<qiiQBQQ", 0, 0, 1 << 30, 1, 0, 0, 0)
++        data = data[:off + 12] + filler * (1025 - len(ckpts)) + data[off + 12:]
++        struct.pack_into("<I", data, off + 8, 1025)
++
++    with open(path, "wb") as f:
++        f.write(data)
++
++    res = server.make_request("POST", "/slots/1?action=restore", data={
++        "filename": "ckpt_damaged.bin",
++    })
++    assert res.status_code == 200
++    if damage in ("oversized_blob", "empty_target"):
++        assert res.body["n_read"] == off
++
++    res = server.make_request("POST", "/completion", data={
++        "prompt": base + "But the second ending was different and sad.",
++        "id_slot": 1,
++        "cache_prompt": True,
++    })
++    assert res.status_code == 200
++    if damage == "many_checkpoints":
++        assert res.body["timings"]["prompt_n"] == n_live
++    else:
++        assert res.body["timings"]["prompt_n"] > n_live
++
++
++# the draft blobs of the checkpoint appendix are not covered by the main payload checks,
++# so restoring into a server with another draft KV cache type must not abort
++@pytest.mark.parametrize("ctkd_restore", ["f16", "q8_0"])
++def test_slot_restore_checkpoints_draft_kv_type_change(swa_server, ctkd_restore):
++    server = swa_server
++    server.model_draft_hf_repo = "ggml-org/tinygemma3-GGUF:Q8_0"  # same file as the target, already in the HF cache
++    server.spec_type = "draft-simple"
++    server.ctkd = "f16"
++    server.start()
++
++    base = "The quick brown fox jumps over the lazy dog. " * 20
++
++    res = server.make_request("POST", "/completion", data={
++        "prompt": base + "The first result of this test is a valid value.",
++        "id_slot": 1,
++        "cache_prompt": True,
++    })
++    assert res.status_code == 200
++
++    res = server.make_request("POST", "/completion", data={
++        "prompt": base + "But the second ending was different and sad.",
++        "id_slot": 1,
++        "cache_prompt": True,
++    })
++    assert res.status_code == 200
++    n_live = res.body["timings"]["prompt_n"]
++
++    res = server.make_request("POST", "/slots/1?action=erase")
++    assert res.status_code == 200
++
++    res = server.make_request("POST", "/completion", data={
++        "prompt": base + "The first result of this test is a valid value.",
++        "id_slot": 1,
++        "cache_prompt": True,
++    })
++    assert res.status_code == 200
++
++    res = server.make_request("POST", "/slots/1?action=save", data={
++        "filename": "ckpt_draft_slot1.bin",
++    })
++    assert res.status_code == 200
++
++    server.stop()
++    server.ctkd = ctkd_restore
++    server.start()
++
++    res = server.make_request("POST", "/slots/1?action=restore", data={
++        "filename": "ckpt_draft_slot1.bin",
++    })
++    assert res.status_code == 200
++
++    res = server.make_request("POST", "/completion", data={
++        "prompt": base + "But the second ending was different and sad.",
++        "id_slot": 1,
++        "cache_prompt": True,
++    })
++    assert res.status_code == 200
++    assert res.body["timings"]["prompt_n"] == n_live
+diff --git a/tools/server/tests/utils.py b/tools/server/tests/utils.py
+index 90c4eba..76e7b2b 100644
+--- a/tools/server/tests/utils.py
++++ b/tools/server/tests/utils.py
+@@ -65,6 +65,7 @@ class ServerProcess:
+     model_url: str | None = None
+     model_file: str | None = None
+     model_draft: str | None = None
++    model_draft_hf_repo: str | None = None
+     n_threads: int | None = None
+     n_gpu_layer: int | None = None
+     n_batch: int | None = None
+@@ -80,6 +81,7 @@ class ServerProcess:
+     n_slots: int | None = None
+     ctk: str | None = None
+     ctv: str | None = None
++    ctkd: str | None = None
+     fa: str | None = None
+     server_continuous_batching: bool | None = False
+     server_embeddings: bool | None = False
+@@ -171,6 +173,8 @@ class ServerProcess:
+             server_args.extend(["--model-url", self.model_url])
+         if self.model_draft:
+             server_args.extend(["--model-draft", self.model_draft])
++        if self.model_draft_hf_repo:
++            server_args.extend(["--hf-repo-draft", self.model_draft_hf_repo])
+         if self.model_hf_repo:
+             server_args.extend(["--hf-repo", self.model_hf_repo])
+         if self.model_hf_file:
+@@ -221,6 +225,8 @@ class ServerProcess:
+             server_args.extend(["-ctk", self.ctk])
+         if self.ctv:
+             server_args.extend(["-ctv", self.ctv])
++        if self.ctkd:
++            server_args.extend(["-ctkd", self.ctkd])
+         if self.fa is not None:
+             server_args.extend(["-fa", self.fa])
+         if self.n_predict:

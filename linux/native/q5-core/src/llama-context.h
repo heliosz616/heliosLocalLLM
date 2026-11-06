@@ -1,0 +1,545 @@
+#pragma once
+
+#include "llama.h"
+#include "llama-ext.h"
+#include "llama-cparams.h"
+#include "llama-graph.h"
+#include "llama-adapter.h"
+#include "llama-impl.h"
+#include "llama-memory.h"
+#include "llama-moe-cache.h"
+
+#include "ggml-cpp.h"
+#include "ggml-opt.h"
+
+#include <array>
+#include <map>
+#include <vector>
+
+struct llama_model;
+class llama_batch_allocr;
+class llama_moe_cache;
+
+class llama_io_read_i;
+class llama_io_write_i;
+
+// "memory" as in abstract memory for the context
+struct llama_memory_i;
+struct llama_memory_context_i;
+
+// stores copy of the memory in device buffer. used for fast state save/load
+struct llama_memory_buffer {
+    int n_tensors = 0;
+    size_t total_size = 0;
+
+    ggml_backend_buffer_ptr buf;
+
+    ggml_context_ptr ctx;
+
+    std::vector<ggml_tensor *> org;
+    std::vector<ggml_tensor *> cpy;
+};
+
+using llama_memory_buffers = std::map<ggml_backend_buffer_type_t, llama_memory_buffer>;
+
+struct llama_context {
+    // init scheduler and compute buffers, reserve worst-case graphs
+    llama_context(
+            const llama_model & model,
+                  llama_context_params params);
+
+    ~llama_context();
+
+    // reserve a new backend scheduler (if needed)
+    // for example, when:
+    //   - changing loras
+    //   - changing samplers
+    //   - changing attention type
+    //   - etc.
+    void sched_reserve();
+
+    // WIP r42 (TODO #42): free the scheduler's compute buffers so the next graph re-reserves them from
+    // that graph (the buffers are otherwise grow-only).  Used to release a wide-prefill layout before
+    // the MoE expert cache arena is sized.
+    void drop_compute_buffers();
+
+    void synchronize();
+
+    const llama_model   & get_model()   const;
+    const llama_cparams & get_cparams() const;
+
+    ggml_backend_sched_t get_sched() const;
+
+    uint32_t n_ctx()     const;
+    uint32_t n_ctx_seq() const;
+    uint32_t n_batch()   const;
+    uint32_t n_ubatch()  const;
+    uint32_t n_seq_max() const;
+
+    uint32_t n_threads()       const;
+    uint32_t n_threads_batch() const;
+
+    llama_memory_t get_memory() const;
+
+    // return true if the memory was updated
+    bool memory_update(bool optimize);
+
+    enum llama_pooling_type pooling_type() const;
+
+    float * get_logits();
+    float * get_logits_ith(int32_t i);
+
+    float * get_embeddings();
+    float * get_embeddings_ith(int32_t i);
+    float * get_embeddings_seq(llama_seq_id seq_id);
+
+    float * get_embeddings_nextn();
+    float * get_embeddings_nextn_ith(int32_t i);
+
+    float * get_embeddings_layer_inp(uint32_t lid);
+
+    llama_token * get_sampled_tokens() const;
+    llama_token   get_sampled_token_ith(int32_t idx);
+
+    float * get_sampled_logits_ith(int32_t idx);
+    size_t  get_sampled_logits_count(int32_t idx);
+
+    float * get_sampled_probs_ith(int32_t idx);
+    size_t  get_sampled_probs_count(int32_t idx);
+
+    const llama_token * get_sampled_candidates_ith(int32_t idx);
+    size_t get_sampled_candidates_count(int32_t idx);
+
+    bool get_causal_attn() const;
+
+    void attach_threadpool(
+            ggml_threadpool_t threadpool,
+            ggml_threadpool_t threadpool_batch);
+
+    void detach_threadpool();
+
+    void set_n_threads(int32_t n_threads, int32_t n_threads_batch);
+
+    void set_abort_callback(bool (*abort_callback)(void * data), void * abort_callback_data);
+
+    void set_embeddings (bool value);
+    void set_embeddings_nextn(bool value, bool masked);
+    void set_embeddings_nextn_from(llama_seq_id seq_id, llama_pos pos);
+    void set_embeddings_layer_inp(uint32_t lid, bool enable);
+    void set_nextn_layer_offset(int32_t offset);
+    void set_experimental_layer_range(int32_t begin, int32_t end);
+    void set_experimental_layer_buffer(ggml_tensor * buffer);
+    void copy_experimental_layer_output(ggml_tensor * buffer, int64_t start_row);
+    void set_causal_attn(bool value);
+    void set_warmup(bool value);
+
+    void set_adapters_lora(llama_adapter_lora ** adapters, size_t n_adapters, float * scales);
+
+    bool adapters_lora_are_same(llama_adapter_lora ** adapters, size_t n_adapters, float * scales);
+
+    bool set_adapter_cvec(
+            const float * data,
+                 size_t   len,
+                int32_t   n_embd,
+                int32_t   il_start,
+                int32_t   il_end);
+
+    // process a single ubatch with a specific graph type
+    // if memory_context is provided, it will be applied first to the context's memory
+    // ret contains the status of the graph computation
+    // returns nullptr only if ret != GGML_STATUS_SUCCESS
+    llm_graph_result * process_ubatch(
+                const llama_ubatch & ubatch,
+                    llm_graph_type   gtype,
+            llama_memory_context_i * mctx,
+                       ggml_status & ret);
+
+    int encode(const llama_batch_ext & batch_inp);
+    int decode(const llama_batch_ext & batch_inp);
+
+    // compat version
+    int encode(const llama_batch & batch_inp);
+    int decode(const llama_batch & batch_inp);
+
+    //
+    // state save/load
+    //
+
+    size_t state_get_size();
+    size_t state_get_data(      uint8_t * dst, size_t size);
+    size_t state_set_data(const uint8_t * src, size_t size);
+
+    size_t state_seq_get_size(llama_seq_id seq_id, llama_state_seq_flags flags);
+
+    size_t state_seq_get_data(llama_seq_id seq_id,       uint8_t * dst, size_t size, llama_state_seq_flags flags);
+
+    // batched state reads: a pinned host staging area of at least `size` bytes (nullptr if unavailable), and the
+    // backend that owns a state tensor's buffer (nullptr if none).  Fold (r96, PR #189).
+    uint8_t *      state_stage(size_t size);
+    ggml_backend_t state_backend(const ggml_tensor * t);
+    // events for the pipelined batched state copies (llama_state_pipe_groups): one per group, created on first use
+    static constexpr size_t n_state_pipe_events = 8;
+    ggml_backend_event_t state_pipe_event(ggml_backend_t backend, size_t group);
+    size_t state_seq_set_data(llama_seq_id seq_id, const uint8_t * src, size_t size, llama_state_seq_flags flags);
+
+    bool state_load_file(
+            const char * filepath,
+           llama_token * tokens_out,
+                size_t   n_token_capacity,
+                size_t * n_token_count_out);
+
+    bool state_save_file(
+            const char * filepath,
+     const llama_token * tokens,
+                size_t   n_token_count);
+
+    size_t state_seq_load_file(
+          llama_seq_id   seq_id,
+            const char * filepath,
+           llama_token * tokens_out,
+                size_t   n_token_capacity,
+                size_t * n_token_count_out);
+
+    size_t state_seq_save_file(
+          llama_seq_id   seq_id,
+            const char * filepath,
+     const llama_token * tokens,
+                size_t   n_token_count);
+
+    //
+    // perf
+    //
+
+    llama_perf_context_data perf_get_data() const;
+    void perf_reset();
+
+    llama_memory_breakdown memory_breakdown() const;
+
+    //
+    // training
+    //
+
+    void opt_init(struct llama_model * model, struct llama_opt_params lopt_params);
+
+    // TODO: more flexible combinations of logical/physical batch size and context size
+    void opt_epoch(
+            ggml_opt_dataset_t      dataset,
+            ggml_opt_result_t       result_train,
+            ggml_opt_result_t       result_eval,
+            int64_t                 idata_split,
+            ggml_opt_epoch_callback callback_train,
+            ggml_opt_epoch_callback callback_eval);
+
+    void opt_epoch_iter(
+            ggml_opt_dataset_t               dataset,
+            ggml_opt_result_t                result,
+            const std::vector<llama_token> & tokens,
+            const std::vector<llama_token> & labels_sparse,
+            llama_batch                    & batch,
+            ggml_opt_epoch_callback          callback,
+            bool                             train,
+            int64_t                          idata_in_loop,
+            int64_t                          ndata_in_loop,
+            int64_t                          t_loop_start);
+
+private:
+    //
+    // output
+    //
+
+    // Make sure enough space is available for outputs.
+    // Returns max number of outputs for which space was reserved.
+    uint32_t output_reserve(int32_t n_outputs);
+
+    void output_reorder();
+
+    // map the output row index `i` to batch index
+    int64_t output_resolve_row(int32_t i) const;
+
+    // async-copy enabled layer-input tensors (per cparams.output_layer_inp)
+    // from backend into host-side embd_layer_inp buffers
+    bool extract_layer_inputs(const llm_graph_result * res, size_t token_offset, size_t n_tokens);
+
+public:
+    // Llama-Frankenstein F1: device-resident layer inputs (target) and device feature injection (draft)
+    void          set_lf_layer_inp_dev(bool enable);
+    ggml_tensor * get_lf_layer_inp_dev(uint32_t lid) const;
+    const int32_t * get_lf_dev_rows(int32_t * n_rows) const;
+    void          set_lf_dev_inject(bool enable);
+    // draft context: mark the target's device layer inputs as read (GPU-side event, no host wait)
+    void          lf_signal_features_consumed();
+    // target context: event the next extraction must wait for before overwriting the buffers
+    void          lf_set_consumed_event(ggml_backend_t backend_reader);
+    ggml_backend_t lf_backend_for(ggml_backend_dev_t dev) const;
+
+private:
+    std::vector<ggml_tensor *> lf_layer_dev;   // [n_layer()+1] F32 [n_embd, n_batch], nullptr if not extracted
+    ggml_context_ptr           lf_layer_ctx;
+    ggml_backend_buffer_ptr    lf_layer_buf;
+    ggml_backend_event_t       lf_consumed_ev      = nullptr;
+    bool                       lf_consumed_pending = false;
+    // F1 with several sequences: the ubatches may reorder the batch (split_equal), the device buffers keep the ubatch
+    // order (output_reorder() only fixes the host buffers): target batch row -> buffer row; empty when the order held
+    std::vector<int32_t>       lf_dev_rows;
+
+    //
+    // graph
+    //
+
+public:
+    uint32_t graph_max_nodes(uint32_t n_tokens) const;
+
+    // can reuse the llm_graph_result instance of the context (for example to update a memory module)
+    llm_graph_result * get_gf_res_reserve() const;
+
+    // returns the result of ggml_backend_sched_graph_compute_async execution
+    ggml_status graph_compute(ggml_cgraph * gf, bool batched);
+
+    // reserve a graph with a dummy ubatch of the specified size
+    // packed_kq_mask: build the measure graph with the packed kq mask even when the derived form is
+    //   enabled, so the reserved buffers cover a batch the derived form cannot serve (see the note in
+    //   graph_reserve).  Pass kq_mask_packed_reachable() for a worst-case reserve; the fused-op
+    //   support probes must NOT set it - they verify the derived form is present in the graph.
+    ggml_cgraph * graph_reserve(
+        uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, bool split_only = false, size_t * sizes = nullptr,
+        bool packed_kq_mask = false);
+
+    // true when a batch the derived kq mask cannot serve is reachable at runtime, i.e. when the
+    // compute reserve must be sized for the packed mask - see the definition for the full reasoning
+    bool kq_mask_packed_reachable() const;
+
+    // TODO #96: the width of the decode/verify layout the slab must keep always-resident.
+    // `cparams.n_rs_batch` is the CORRECTNESS bound (the widest per-seq batch a partial rollback can land
+    // in) and is set from the UNCLAMPED speculator config, because whether the draft may stay wide is
+    // decided after the context exists.  The layout this run will actually issue is capped by the MoE
+    // expert cache's verify band when the arena is live (`common` clamps a draftless speculator to
+    // `band - 1`), and reserving the unclamped width would take ~5 GiB of arena for a verify the band
+    // forbids.  Returns `cparams.n_rs_batch` when there is no band (no arena: nothing to reserve for).
+    uint32_t verify_batch_width() const;
+
+    bool set_sampler(llama_seq_id seq_id, llama_sampler * sampler);
+
+private:
+    llm_graph_result * get_gf_res_prev(bool alt);
+
+    llm_graph_params graph_params(
+                        llm_graph_result * res,
+                      const llama_ubatch & ubatch,
+            const llama_memory_context_i * mctx,
+                          llm_graph_type   gtype) const;
+
+    llm_graph_cb graph_get_cb() const;
+
+    // create a new backend scheduler for a graph of the specified size and register the callbacks below
+    void sched_new(size_t max_nodes, bool parallel);
+
+    // swap the second scheduler (and its graph-reuse state) in or out of `sched`, creating it on first use
+    void sched_alt_select(bool alt);
+
+    // whether this ubatch is the draft context's second graph (the draft step) rather than its ingest /
+    // KV-injection graph; the batch kind, not `n_outputs`, is the discriminator for DFlash/DFlash2
+    bool sched_alt_for(const llama_ubatch & ubatch) const;
+
+    // ggml_backend_sched copy callback, copies only the experts used by MUL_MAT_ID and updates the MoE cache
+    static bool sched_copy_experts(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph, void * user_data);
+
+    // ggml_backend_sched realloc callback, counts and traces the graph reallocations of this context
+    static void sched_graph_realloc(ggml_backend_sched_t sched, ggml_cgraph * gf, bool backend_ids_changed, bool graph_size_changed, void * user_data);
+
+    // disable auto fused ops (Flash Attention, Gated Delta Net) whose op lands on a device
+    // that differs from the layer it belongs to (usually due to missing backend support)
+    void resolve_fused_ops(const llama_memory_context_i * mctx, uint32_t n_seqs);
+
+    // TODO: read/write lora adapters and cvec
+    size_t state_write_data(llama_io_write_i & io);
+    size_t state_read_data (llama_io_read_i  & io);
+
+    size_t state_seq_write_data(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags);
+    size_t state_seq_read_data (llama_io_read_i  & io, llama_seq_id seq_id, llama_state_seq_flags flags);
+
+    //
+    // members
+    //
+
+    const llama_model & model;
+
+    llama_cparams cparams;
+
+    llama_adapter_cvec_ptr  cvec;
+    llama_adapter_loras_ptr loras;
+
+    llama_cross cross; // TODO: tmp for handling cross-attention - need something better probably
+
+    // MTP draft vocabulary subset used by this context's graphs (nullptr = full vocabulary)
+    std::shared_ptr<const llama_mtp_draft_vocab> mtp_draft;
+
+    llama_memory_ptr memory;
+    llama_moe_cache_ptr moe_cache;
+
+    // decode output (2-dimensional array: [n_outputs][n_vocab])
+    buffer_view<float> logits = {nullptr, 0};
+
+    // embeddings output (2-dimensional array: [n_outputs][n_embd])
+    // populated only when pooling_type == LLAMA_POOLING_TYPE_NONE
+    buffer_view<float> embd = {nullptr, 0};
+
+    // hidden state required by the nextn layers (2-dimensional array: [n_outputs][n_embd])
+    // populated only when cparams.embeddings_nextn is enabled and the model graph
+    // sets llm_graph_result::t_h_nextn
+    buffer_view<float> embd_nextn = {nullptr, 0};
+    llama_pos          embd_nextn_from[LLAMA_MAX_SEQ] = {};   // set_embeddings_nextn_from: rows below are not read back
+
+    // host buffers for output layer input embeddings, per layer
+    // populated when cparams.output_layer_inp[il] is true
+    std::vector<buffer_view<float>> embd_layer_inp;
+    std::vector<int32_t> embd_batch_idxs; // extracted index -> original batch index
+
+    struct sampling_info {
+        // !samplers.empty() to check if any samplers are active
+        std::map<llama_seq_id, llama_sampler *> samplers;
+
+        buffer_view<float>       logits     = {nullptr, 0};
+        buffer_view<llama_token> sampled    = {nullptr, 0};
+        buffer_view<float>       probs      = {nullptr, 0};
+        buffer_view<llama_token> candidates = {nullptr, 0};
+
+        std::vector<uint32_t> logits_count;
+        std::vector<uint32_t> probs_count;
+        std::vector<uint32_t> candidates_count;
+
+        // optimization
+        std::vector<llama_token> token_ids_full_vocab;
+    };
+
+    sampling_info sampling;
+
+    // sequence embeddings output (map of [n_embd] vectors)
+    // populated only when pooling_type != LLAMA_POOLING_TYPE_NONE
+    std::map<llama_seq_id, std::vector<float>> embd_seq;
+
+    // reuse the batch_allocr to avoid unnecessary memory allocations
+    std::unique_ptr<llama_batch_allocr> balloc;
+
+    uint32_t n_input_tensors = 0; // number of tensors marked as input during the last graph reserve
+    uint32_t n_outputs = 0; // number of actually-used outputs in the current ubatch or last logical batch
+
+    // WIP r42 (TODO #42): previous ubatch size, used to detect the prefill -> decode transition and
+    // release the wide-prefill compute buffer before the MoE expert cache arena is sized.
+    uint32_t n_tokens_prev = 0;
+
+    std::vector<int32_t> output_ids; // map batch token positions to ids of the logits and embd buffers
+
+    struct swap_info {
+        uint32_t i0;
+        uint32_t i1;
+    };
+
+    std::vector<swap_info> output_swaps;
+
+    ggml_backend_sched_ptr sched;
+
+    // The MTP draft context alternates a no-output ingest graph and a 1-token draft-step graph every cycle; with
+    // one scheduler each switch re-splits and re-allocates the graph.  The graphs with outputs run on a second
+    // scheduler, so both stay allocated and are reused.  It is swapped into `sched` only while a decode or encode
+    // runs (LLAMA_DRAFT_SCHED2=0: off).  A DFlash/DFlash2 draft alternates unlike graphs that BOTH have no
+    // outputs (a KV injection and a noise block whose lattice comes from h_nextn), so there the batch kind picks
+    // the slot - see `sched_alt_for()`.
+    ggml_backend_sched_ptr sched_alt;
+    bool                   sched_alt_in_use = false;
+
+    bool sched_need_reserve = true;
+
+    // whether the reserve graph has a logits tensor, set in sched_reserve()
+    // true until then, because the first output_reserve() runs before any graph is reserved
+    bool graph_has_logits = true;
+
+    // state of sched_copy_experts, reset before each graph compute
+    struct copy_experts_info {
+        const ggml_tensor *  ids = nullptr;
+        std::vector<int32_t> ids_data;
+        std::vector<bool>    used;
+
+        void reset() {
+            ids = nullptr;
+            ids_data.clear();
+            used.clear();
+        }
+    };
+
+    copy_experts_info copy_experts;
+
+    // graph reallocations during inference where the backend assignments did not change, split by whether the
+    // graph size is the same as the previously scheduled one (unexpected) or different
+    int32_t n_reallocs_same = 0;
+    int32_t n_reallocs_diff = 0;
+
+    ggml_backend_t backend_cpu = nullptr;
+    std::vector<ggml_backend_ptr> backends;
+
+    // pinned staging for the batched state reads of llama_io_write_host (see state_stage).  Fold (r96, PR #189):
+    // retained across saves and one buffer per context (state saves on one context must not run concurrently).
+    ggml_backend_buffer_ptr buf_state_stage;
+    std::vector<std::pair<ggml_backend_t, std::array<ggml_backend_event_t, n_state_pipe_events>>> state_pipe_evs;
+
+    // training
+    ggml_opt_context_t opt_ctx = nullptr;
+
+    ggml_threadpool_t threadpool       = nullptr;
+    ggml_threadpool_t threadpool_batch = nullptr;
+
+    ggml_abort_callback abort_callback      = nullptr;
+    void *              abort_callback_data = nullptr;
+
+    std::vector<std::pair<ggml_backend_t, ggml_backend_set_n_threads_t>> set_n_threads_fns;
+
+    // pointers and buffer types used for the compute buffer of each backend
+    std::vector<ggml_backend_t>             backend_ptrs;
+    std::vector<ggml_backend_buffer_type_t> backend_buft;
+    std::vector<size_t>                     backend_buf_exp_size; // expected buffer sizes
+
+    // Separate arenas give batches with and without outputs distinct CUDA graph cache keys.
+    std::array<llm_graph_result_ptr, 2> gf_res_prev;
+    llm_graph_result_ptr gf_res_reserve;
+
+    llm_graph_result * gf_res_prev_active = nullptr;
+    llm_graph_result * gf_res_prev_active_alt = nullptr; // the reuse state of the scheduler not in `sched`
+
+    // host buffer for the model output (logits and embeddings)
+    ggml_backend_buffer_ptr buf_output;
+
+    // keep copies of the per-sequence memory on the device
+    std::map<llama_seq_id, llama_memory_buffers> mem_storage;
+
+    bool has_evaluated_once = false;
+
+    // OPEN 2: per host-expert device, the size of the movable-boundary slab's WORK region as it stood right
+    // after the last compute-reserve drop.  That is the narrow layout this workload settled on, and the
+    // value the next pass compares the live region against to decide whether the wide reserve is being held
+    // without need (see the drop decision in `process_ubatch`).  Only written when a backend reports a slab
+    // (`ggml_backend_dev_slab_work_size` != 0), so it stays empty on non-slab backends.
+    std::map<ggml_backend_dev_t, size_t> slab_narrow_boundary;
+    // wip/slab-ring-region: the narrow (decode/verify) work floor was pinned before the first wide view
+    // was placed, so the slab could carve the H2D staging ring for the first prefill (not only after the
+    // first prefill -> decode transition).
+    bool slab_narrow_pinned = false;
+
+    // env: LLAMA_GRAPH_REUSE_DISABLE
+    bool graph_reuse_disable = false;
+
+    // true after the prism.hadamard coverage check passes on a reserved graph
+    bool hadamard_verified = false;
+
+    // perf
+    mutable int64_t t_start_us  = 0;
+    mutable int64_t t_load_us   = 0;
+    mutable int64_t t_p_eval_us = 0;
+    mutable int64_t t_eval_us   = 0;
+
+    mutable int64_t t_compute_start_us = 0;
+    mutable int64_t n_queued_tokens    = 0;
+
+    mutable int32_t n_p_eval = 0; // number of tokens in eval calls for the prompt (with batch size > 1)
+    mutable int32_t n_eval   = 0; // number of eval calls
+
+    mutable int32_t n_reused = 0; // number of times the previous graph was reused
+};

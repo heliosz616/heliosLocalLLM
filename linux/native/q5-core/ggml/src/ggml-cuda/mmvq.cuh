@@ -1,0 +1,85 @@
+#include "common.cuh"
+
+#define MMVQ_MAX_BATCH_SIZE 8 // Max. batch size for which to use MMVQ kernels.
+// Dedicated MUL_MAT_ID MoE kernel band (mul_mat_vec_q_moe).  That kernel is one warp per token and
+// its per-token reduction does not depend on the column count, so it covers the whole speculative
+// verify range (--spec-draft-n-max <= 15 -> n_tokens <= 16) on a single accumulation order.  The
+// dense MMVQ band above stays at 8; only the MUL_MAT_ID (routed expert) path uses this one.
+#define MMVQ_MOE_MAX_BATCH_SIZE 16
+
+// The original-weight Q5 WMMA verifier can consume sixteen Q8 activation rows.
+// Extend only row-generic activation producers; weight-fusion kernels retain
+// their original compiled band. This is opt-in with the wider Q5 experiment.
+static inline int ggml_cuda_q8_1_verify_max_batch() {
+#if defined(GGML_USE_HIP)
+    static const bool wide = [] {
+        const char *v = getenv("GGML_HIP_Q5_PIPELINE_WIDE16");
+        return v && v[0] == '1' && v[1] == 0;
+    }();
+    if (wide) return 16;
+#endif
+    return MMVQ_MAX_BATCH_SIZE;
+}
+
+bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11);
+
+// Returns the maximum batch size for which MMVQ should be used for MUL_MAT_ID,
+// based on the quantization type and GPU architecture (compute capability).
+int get_mmvq_mmid_max_batch(ggml_type type, int cc);
+
+void ggml_cuda_mul_mat_vec_q(ggml_backend_cuda_context & ctx,
+    const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst, const ggml_cuda_mm_fusion_args_host * fusion = nullptr);
+
+void ggml_cuda_op_mul_mat_vec_q(
+    ggml_backend_cuda_context & ctx,
+    const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, const char * src0_dd_i, const float * src1_ddf_i,
+    const char * src1_ddq_i, float * dst_dd_i, const int64_t row_low, const int64_t row_high, const int64_t src1_ncols,
+    const int64_t src1_padded_row_size, cudaStream_t stream);
+
+void ggml_cuda_op_ssm_gate_beta(
+    ggml_backend_cuda_context & ctx,
+    const ggml_tensor * src0_alpha, const ggml_tensor * src0_beta, const ggml_tensor * src1,
+    const ggml_tensor * dt, const ggml_tensor * ssm_a,
+    ggml_tensor * dst_gate, ggml_tensor * dst_beta);
+
+void ggml_cuda_op_ssm_conv_l2_gatebeta(
+    ggml_backend_cuda_context & ctx,
+    const ggml_tensor * conv_input, const ggml_tensor * conv_w,
+    const ggml_tensor * src0_alpha, const ggml_tensor * src0_beta, const ggml_tensor * src1,
+    const ggml_tensor * dt, const ggml_tensor * ssm_a,
+    ggml_tensor * q_norm, ggml_tensor * k_norm, ggml_tensor * v_raw,
+    ggml_tensor * dst_gate, ggml_tensor * dst_beta,
+    const int head_k_dim, const int n_qk_heads,
+    const int head_v_dim, const int n_v_heads, const float eps);
+
+void ggml_cuda_op_shexp_down_gate(
+    ggml_backend_cuda_context & ctx,
+    const ggml_tensor * w_down, const ggml_tensor * swiglu,
+    const ggml_tensor * w_gate, const ggml_tensor * x_gate,
+    const ggml_tensor * moe_out, const ggml_tensor * ffn_residual,
+    ggml_tensor * dst);
+
+// qwen4exp IQ4_NL/Q8_0 routed down projection fused with the 10-expert weighted sum (RDNA3.5,
+// single-token): ggml_cuda_mul_mat_id_weighted_rdna3_5_ok returns whether the graph pattern's
+// experts/weights/dst match the specialized kernel's shape fingerprint.
+bool ggml_cuda_mul_mat_id_weighted_rdna3_5_ok(const ggml_tensor * experts, const ggml_tensor * weights, const ggml_tensor * dst);
+void ggml_cuda_mul_mat_id_weighted_rdna3_5(
+    ggml_backend_cuda_context & ctx,
+    const ggml_tensor * experts, const ggml_tensor * weights, ggml_tensor * dst);
+
+bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor, const bool verify_band = false);
+
+int ggml_cuda_mul_mat_id_weighted_down_try_fuse(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i);
+
+int ggml_cuda_ssm_conv_in_try_fuse(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i);
+int ggml_cuda_ssm_prescan_try_fuse(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i);
+
+int ggml_cuda_mul_mat_dual_output_try_fuse(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i);
+int ggml_cuda_moe_down_fold_try_fuse(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i);
+
+int ggml_cuda_gate_beta_verify_try_fuse(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i);
+int ggml_cuda_shexp_down_gate_try_fuse(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i);
+
+bool ggml_cuda_match_shared_expert(const ggml_cgraph * graph, int routed_idx, int shared_idx);
+int  ggml_cuda_match_shared_expert_try_fuse(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i);
+void ggml_cuda_glu_q8_1_mark(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i);

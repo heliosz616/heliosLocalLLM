@@ -1,0 +1,6 @@
+fastapi>=0.115,<1
+uvicorn>=0.34,<1
+httpx>=0.28,<1
+requests>=2.32,<3
+openai>=1.100,<3
+pytest>=8,<10

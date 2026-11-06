@@ -1,0 +1,14 @@
+**/.venv/
+**/__pycache__/
+**/.pytest_cache/
+qwen27b/vendor/
+qwen27b/build/
+qwen27b/models/
+qwen27b/state/
+qwen27b/reports/
+**/*.local.json
+**/*.log
+runtime/*.lock
+*.zip
+.env
+.env.*

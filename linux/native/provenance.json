@@ -1,0 +1,14 @@
+[
+  {
+    "component": "flash",
+    "host_revision": "v12",
+    "scope": "Retained local source areas and final checkpoint host; no binary or private build manifest included",
+    "rebuild_status": "Full binary-to-source reproduction not re-established for this archive"
+  },
+  {
+    "component": "q5",
+    "host_revision": "v10",
+    "scope": "Retained local source areas and final checkpoint host; no binary or private build manifest included",
+    "rebuild_status": "Full binary-to-source reproduction not re-established for this archive"
+  }
+]

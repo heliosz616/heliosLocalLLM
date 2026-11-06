@@ -1,0 +1,18 @@
+{
+  "host": "127.0.0.1",
+  "port": 8080,
+  "default_model": "qwen3.8-flash",
+  "state_directory": "${ROOT}/state/serving",
+  "api_key_file": "${ROOT}/state/serving/api-key",
+  "additional_api_keys_file": "${ROOT}/state/serving/api-keys.json",
+  "warm_start": false,
+  "startup_timeout_seconds": 900,
+  "request_timeout_seconds": 3600,
+  "max_request_bytes": 268435456,
+  "native_keepalive_connections": 0,
+  "stream_keepalive_seconds": 10,
+  "ssd_disk_reserve_gib": 16,
+  "kv_cache_retention_hours": 24,
+  "kv_cache_cleanup_interval_seconds": 300,
+  "kv_cache_maximum_bytes": 64000000000
+}

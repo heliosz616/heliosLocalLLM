@@ -1,0 +1,182 @@
+if (NOT EXISTS $ENV{ROCM_PATH})
+    if (NOT EXISTS /opt/rocm)
+        set(ROCM_PATH /usr)
+    else()
+        set(ROCM_PATH /opt/rocm)
+    endif()
+else()
+    set(ROCM_PATH $ENV{ROCM_PATH})
+endif()
+
+list(APPEND CMAKE_PREFIX_PATH  ${ROCM_PATH})
+list(APPEND CMAKE_PREFIX_PATH "${ROCM_PATH}/lib64/cmake")
+
+if (NOT DEFINED CMAKE_HIP_FLAGS_DEBUG)
+    set(CMAKE_HIP_FLAGS_DEBUG "-g -Xarch_device -O2 -Xarch_host -O0")
+endif()
+
+# CMake on Windows doesn't support the HIP language yet
+if (WIN32)
+    set(CXX_IS_HIPCC TRUE)
+else()
+    string(REGEX MATCH "hipcc(\.bat)?$" CXX_IS_HIPCC "${CMAKE_CXX_COMPILER}")
+endif()
+
+if (CXX_IS_HIPCC)
+    if (LINUX)
+        if (NOT ${CMAKE_CXX_COMPILER_ID} MATCHES "Clang")
+            message(WARNING "Only LLVM is supported for HIP, hint: CXX=/opt/rocm/llvm/bin/clang++")
+        endif()
+
+        message(WARNING "Setting hipcc as the C++ compiler is legacy behavior."
+                " Prefer setting the HIP compiler directly. See README for details.")
+    endif()
+else()
+    # Forward (AMD)GPU_TARGETS to CMAKE_HIP_ARCHITECTURES.
+    if(AMDGPU_TARGETS AND NOT GPU_TARGETS)
+        set(GPU_TARGETS ${AMDGPU_TARGETS})
+    endif()
+    if(GPU_TARGETS AND NOT CMAKE_HIP_ARCHITECTURES)
+        set(CMAKE_HIP_ARCHITECTURES ${GPU_TARGETS})
+    endif()
+    cmake_minimum_required(VERSION 3.21)
+    enable_language(HIP)
+endif()
+
+find_package(hip     REQUIRED)
+find_package(hipblas REQUIRED)
+find_package(rocblas REQUIRED)
+
+if (GGML_HIP_RCCL)
+    find_package(rccl REQUIRED)
+endif()
+
+if (${hip_VERSION} VERSION_LESS 6.1)
+    message(FATAL_ERROR "At least ROCM/HIP V6.1 is required")
+endif()
+
+message(STATUS "HIP and hipBLAS found")
+
+file(GLOB   GGML_HEADERS_ROCM "../ggml-cuda/*.cuh")
+list(APPEND GGML_HEADERS_ROCM "../../include/ggml-cuda.h")
+
+file(GLOB   GGML_SOURCES_ROCM "../ggml-cuda/*.cu")
+# The 512-head flash-attn MMA instances are by far the longest single compiles (~130 s each);
+# list them first so make's FIFO dispatch starts them at t=0 instead of leaving them as the tail
+# of the build (the same as the generated per-head/per-type split -- this is build order only).
+file(GLOB   SRCS_FA_HEAVY "../ggml-cuda/template-instances/fattn-mma*-dkq512-*.cu")
+list(INSERT GGML_SOURCES_ROCM 0 ${SRCS_FA_HEAVY})
+file(GLOB   SRCS "../ggml-cuda/template-instances/fattn-tile*.cu")
+list(APPEND GGML_SOURCES_ROCM ${SRCS})
+file(GLOB   SRCS "../ggml-cuda/template-instances/fattn-mma*.cu")
+list(REMOVE_ITEM SRCS ${SRCS_FA_HEAVY})
+list(APPEND GGML_SOURCES_ROCM ${SRCS})
+file(GLOB   SRCS "../ggml-cuda/template-instances/mmq*.cu")
+list(APPEND GGML_SOURCES_ROCM ${SRCS})
+file(GLOB   SRCS "../ggml-cuda/template-instances/mmf*.cu")
+list(APPEND GGML_SOURCES_ROCM ${SRCS})
+
+ggml_cuda_fattn_vec_instances(${CMAKE_CURRENT_SOURCE_DIR}/../ggml-cuda SRCS)
+list(APPEND GGML_SOURCES_ROCM ${SRCS})
+
+ggml_add_backend_library(ggml-hip
+                         ${GGML_HEADERS_ROCM}
+                         ${GGML_SOURCES_ROCM}
+                        )
+
+# TODO: do not use CUDA definitions for HIP
+if (NOT GGML_BACKEND_DL)
+    target_compile_definitions(ggml PUBLIC GGML_USE_CUDA)
+endif()
+
+add_compile_definitions(GGML_USE_HIP)
+
+# GGML_USE_HIP must also be visible to the main libraries: src/llama-arch.cpp's
+# qwen4exp tensor-split gate reads it.  ggml_add_backend() only publishes the
+# GGML_USE_<backend> macro on the `ggml` target when GGML_BACKEND_DL is OFF, so
+# a dynamic-backend build (e.g. the published containers) would otherwise
+# compile that gate as HIP-absent and reject `-sm tensor` for qwen4exp even
+# though the HIP backend is built.  Publishing it here covers both cases; the
+# static build already got it from ggml_add_backend(HIP).
+target_compile_definitions(ggml PUBLIC GGML_USE_HIP)
+
+if (GGML_CUDA_FORCE_MMQ)
+    add_compile_definitions(GGML_CUDA_FORCE_MMQ)
+endif()
+
+if (GGML_CUDA_FORCE_CUBLAS)
+    add_compile_definitions(GGML_CUDA_FORCE_CUBLAS)
+endif()
+
+if (GGML_CUDA_NO_PEER_COPY)
+    add_compile_definitions(GGML_CUDA_NO_PEER_COPY)
+endif()
+
+if (GGML_HIP_GRAPHS)
+    add_compile_definitions(GGML_HIP_GRAPHS)
+endif()
+
+if (GGML_HIP_NO_VMM)
+    add_compile_definitions(GGML_HIP_NO_VMM)
+endif()
+
+if (NOT GGML_HIP_MMQ_MFMA)
+    add_compile_definitions(GGML_HIP_NO_MMQ_MFMA)
+endif()
+
+if (GGML_HIP_RCCL)
+    add_compile_definitions(GGML_USE_NCCL) # RCCL has the same interface as NCCL.
+endif()
+
+if (GGML_HIP_EXPORT_METRICS)
+    set(CMAKE_HIP_FLAGS "${CMAKE_HIP_FLAGS} -Rpass-analysis=kernel-resource-usage --save-temps")
+endif()
+
+# Silence the "loop not unrolled" flood from the FlashAttention kernels.
+# AMDGPU clang's loop-unroll pass reports every bare `#pragma unroll` it cannot
+# honour, and `fattn-mma-f16.cuh` has several on runtime-bounded loops (the
+# K/V staging loop and the sparse combine path).  That is upstream noise, but
+# the delivery's native-KV arms instantiate the whole WMMA kernel once per KV
+# type per instance TU, which multiplies it into ~10k warning lines per clean
+# build.  The pragmas are advisory hints, the pass already failed, and the code
+# is unaffected, so keep `-Wpass-failed` off for the HIP build only (the flag is
+# a Clang/AMDGPU one; the CUDA toolchains do not emit this diagnostic).
+set(CMAKE_HIP_FLAGS "${CMAKE_HIP_FLAGS} -Wno-pass-failed")
+
+if (NOT GGML_CUDA_FA)
+    add_compile_definitions(GGML_CUDA_NO_FA)
+endif()
+
+if (CXX_IS_HIPCC)
+    set_source_files_properties(${GGML_SOURCES_ROCM} PROPERTIES LANGUAGE CXX)
+    if (WIN32 AND CMAKE_BUILD_TYPE STREQUAL "Debug")
+        # CMake on Windows doesn't support the HIP language yet.
+        # Therefore we workaround debug build's failure on HIP backend this way.
+        set_source_files_properties(${GGML_SOURCES_ROCM} PROPERTIES COMPILE_FLAGS "-O2 -g")
+    endif()
+    target_link_libraries(ggml-hip PRIVATE hip::device)
+else()
+    set_source_files_properties(${GGML_SOURCES_ROCM} PROPERTIES LANGUAGE HIP)
+endif()
+
+if (GGML_STATIC)
+    message(FATAL_ERROR "Static linking not supported for HIP/ROCm")
+endif()
+
+if (GGML_HIP_RCCL)
+    target_link_libraries(ggml-hip PRIVATE ggml-base roc::rccl)
+endif()
+
+target_link_libraries(ggml-hip PRIVATE ggml-base hip::host roc::rocblas roc::hipblas)
+
+# Opt-in measured prefill GEMM selection; default builds keep their existing BLAS.
+option(GGML_HIP_Q5_LT "Measured Q5 prefill hipBLASLt dispatch" OFF)
+if (GGML_HIP_Q5_LT)
+    find_package(hipblaslt REQUIRED)
+    get_target_property(Q5_LT_DEFINITIONS roc::hipblaslt INTERFACE_COMPILE_DEFINITIONS)
+    get_target_property(Q5_LT_INCLUDES roc::hipblaslt INTERFACE_INCLUDE_DIRECTORIES)
+    set_property(SOURCE ../ggml-cuda/ggml-cuda.cu APPEND PROPERTY COMPILE_DEFINITIONS GGML_HIP_Q5_LT ${Q5_LT_DEFINITIONS})
+    set_property(SOURCE ../ggml-cuda/ggml-cuda.cu APPEND PROPERTY INCLUDE_DIRECTORIES ${Q5_LT_INCLUDES})
+    # Keep hipBLASLt's ABI definitions local to its caller, preserving existing kernel objects.
+    target_link_libraries(ggml-hip PRIVATE "$<TARGET_FILE:roc::hipblaslt>")
+endif()

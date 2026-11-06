@@ -1,0 +1,182 @@
+[
+  {
+    "path": "linux/native/flash-core/vendor/miniaudio/miniaudio.h",
+    "rule": "email",
+    "line_sha256": "39cf2884fcbe5934298c90db8bc0af1fbfddbf31e384811514367f6c43a14697",
+    "reason": "Public upstream copyright attribution, source documentation or example; retained with upstream source notices."
+  },
+  {
+    "path": "linux/native/flash-core/vendor/miniaudio/miniaudio.h",
+    "rule": "private-address",
+    "line_sha256": "9b71d5e08b0b0f207d04953172dcc1a22e419612504b611e667e23c191500ec7",
+    "reason": "Upstream documentation section number, not a network address."
+  },
+  {
+    "path": "linux/native/flash-core/vendor/nlohmann/json.hpp",
+    "rule": "email",
+    "line_sha256": "26c91fb098b24645c3529ef3ef51475531aeb82de3a542eb573f06aebeb118c7",
+    "reason": "Public upstream copyright attribution, source documentation or example; retained with upstream source notices."
+  },
+  {
+    "path": "linux/native/flash-core/vendor/nlohmann/json.hpp",
+    "rule": "email",
+    "line_sha256": "f30f18a396670eda9bf2cc916d33515451cac50142d7624e3f9287854506271c",
+    "reason": "Public upstream copyright attribution, source documentation or example; retained with upstream source notices."
+  },
+  {
+    "path": "linux/native/flash-core/vendor/nlohmann/json.hpp",
+    "rule": "email",
+    "line_sha256": "fc9d9924a7b9cdab2d69011288b9a56a25f98afa2bee6b6f792fdd6c2dd97b82",
+    "reason": "Public upstream copyright attribution, source documentation or example; retained with upstream source notices."
+  },
+  {
+    "path": "linux/native/flash-core/vendor/nlohmann/json.hpp",
+    "rule": "email",
+    "line_sha256": "1c9e54bef7926aae81c5df97f479339dd27464331399c52e1edd35aa002e6306",
+    "reason": "Public upstream copyright attribution, source documentation or example; retained with upstream source notices."
+  },
+  {
+    "path": "linux/native/flash-core/vendor/hash/sha1/sha1.c",
+    "rule": "email",
+    "line_sha256": "bb34bbad82a202bc129913799ec0ac342ff5caeb7c85fb9cef8eec15a0969714",
+    "reason": "Public upstream copyright attribution, source documentation or example; retained with upstream source notices."
+  },
+  {
+    "path": "linux/native/flash-core/vendor/hash/sha1/sha1.h",
+    "rule": "email",
+    "line_sha256": "cb45e9909f965a16a72cc8279bd6168a3852d5e7065fa58047adface1059110d",
+    "reason": "Public upstream copyright attribution, source documentation or example; retained with upstream source notices."
+  },
+  {
+    "path": "linux/native/flash-core/vendor/hash/rotate-bits/LICENSE.md",
+    "rule": "email",
+    "line_sha256": "5ffff5139e0d27191865a095b1c21903db7f22238d5f36795d6aade89441bf26",
+    "reason": "Public upstream copyright attribution, source documentation or example; retained with upstream source notices."
+  },
+  {
+    "path": "linux/native/flash-core/ggml/include/ggml-opt.h",
+    "rule": "email",
+    "line_sha256": "007860bc25a588859709a416a4dd8039420038e3c5ca3c1f497369e28e991f34",
+    "reason": "Public upstream copyright attribution, source documentation or example; retained with upstream source notices."
+  },
+  {
+    "path": "linux/native/flash-core/ggml/include/gguf.h",
+    "rule": "email",
+    "line_sha256": "007860bc25a588859709a416a4dd8039420038e3c5ca3c1f497369e28e991f34",
+    "reason": "Public upstream copyright attribution, source documentation or example; retained with upstream source notices."
+  },
+  {
+    "path": "linux/native/flash-core/ggml/src/ggml-cpu/kleidiai/kernels.cpp",
+    "rule": "email",
+    "line_sha256": "a106ad950298963c04ea4bd3b7eb2bc5d8cff316819b4162e257fa4c76c3d8d6",
+    "reason": "Public upstream copyright attribution, source documentation or example; retained with upstream source notices."
+  },
+  {
+    "path": "linux/native/flash-core/ggml/src/ggml-cpu/kleidiai/kleidiai.h",
+    "rule": "email",
+    "line_sha256": "70e7f5986c228913831eee7dfaef956349577970b4989af292c5fd390ff5987b",
+    "reason": "Public upstream copyright attribution, source documentation or example; retained with upstream source notices."
+  },
+  {
+    "path": "linux/native/flash-core/ggml/src/ggml-cpu/kleidiai/kleidiai.cpp",
+    "rule": "email",
+    "line_sha256": "a106ad950298963c04ea4bd3b7eb2bc5d8cff316819b4162e257fa4c76c3d8d6",
+    "reason": "Public upstream copyright attribution, source documentation or example; retained with upstream source notices."
+  },
+  {
+    "path": "linux/native/flash-core/ggml/src/ggml-cpu/kleidiai/kernels.h",
+    "rule": "email",
+    "line_sha256": "a106ad950298963c04ea4bd3b7eb2bc5d8cff316819b4162e257fa4c76c3d8d6",
+    "reason": "Public upstream copyright attribution, source documentation or example; retained with upstream source notices."
+  },
+  {
+    "path": "linux/native/q5-core/vendor/miniaudio/miniaudio.h",
+    "rule": "email",
+    "line_sha256": "39cf2884fcbe5934298c90db8bc0af1fbfddbf31e384811514367f6c43a14697",
+    "reason": "Public upstream copyright attribution, source documentation or example; retained with upstream source notices."
+  },
+  {
+    "path": "linux/native/q5-core/vendor/miniaudio/miniaudio.h",
+    "rule": "private-address",
+    "line_sha256": "9b71d5e08b0b0f207d04953172dcc1a22e419612504b611e667e23c191500ec7",
+    "reason": "Upstream documentation section number, not a network address."
+  },
+  {
+    "path": "linux/native/q5-core/vendor/nlohmann/json.hpp",
+    "rule": "email",
+    "line_sha256": "26c91fb098b24645c3529ef3ef51475531aeb82de3a542eb573f06aebeb118c7",
+    "reason": "Public upstream copyright attribution, source documentation or example; retained with upstream source notices."
+  },
+  {
+    "path": "linux/native/q5-core/vendor/nlohmann/json.hpp",
+    "rule": "email",
+    "line_sha256": "f30f18a396670eda9bf2cc916d33515451cac50142d7624e3f9287854506271c",
+    "reason": "Public upstream copyright attribution, source documentation or example; retained with upstream source notices."
+  },
+  {
+    "path": "linux/native/q5-core/vendor/nlohmann/json.hpp",
+    "rule": "email",
+    "line_sha256": "fc9d9924a7b9cdab2d69011288b9a56a25f98afa2bee6b6f792fdd6c2dd97b82",
+    "reason": "Public upstream copyright attribution, source documentation or example; retained with upstream source notices."
+  },
+  {
+    "path": "linux/native/q5-core/vendor/nlohmann/json.hpp",
+    "rule": "email",
+    "line_sha256": "1c9e54bef7926aae81c5df97f479339dd27464331399c52e1edd35aa002e6306",
+    "reason": "Public upstream copyright attribution, source documentation or example; retained with upstream source notices."
+  },
+  {
+    "path": "linux/native/q5-core/vendor/hash/sha1/sha1.c",
+    "rule": "email",
+    "line_sha256": "bb34bbad82a202bc129913799ec0ac342ff5caeb7c85fb9cef8eec15a0969714",
+    "reason": "Public upstream copyright attribution, source documentation or example; retained with upstream source notices."
+  },
+  {
+    "path": "linux/native/q5-core/vendor/hash/sha1/sha1.h",
+    "rule": "email",
+    "line_sha256": "cb45e9909f965a16a72cc8279bd6168a3852d5e7065fa58047adface1059110d",
+    "reason": "Public upstream copyright attribution, source documentation or example; retained with upstream source notices."
+  },
+  {
+    "path": "linux/native/q5-core/vendor/hash/rotate-bits/LICENSE.md",
+    "rule": "email",
+    "line_sha256": "5ffff5139e0d27191865a095b1c21903db7f22238d5f36795d6aade89441bf26",
+    "reason": "Public upstream copyright attribution, source documentation or example; retained with upstream source notices."
+  },
+  {
+    "path": "linux/native/q5-core/ggml/include/ggml-opt.h",
+    "rule": "email",
+    "line_sha256": "007860bc25a588859709a416a4dd8039420038e3c5ca3c1f497369e28e991f34",
+    "reason": "Public upstream copyright attribution, source documentation or example; retained with upstream source notices."
+  },
+  {
+    "path": "linux/native/q5-core/ggml/include/gguf.h",
+    "rule": "email",
+    "line_sha256": "007860bc25a588859709a416a4dd8039420038e3c5ca3c1f497369e28e991f34",
+    "reason": "Public upstream copyright attribution, source documentation or example; retained with upstream source notices."
+  },
+  {
+    "path": "linux/native/q5-core/ggml/src/ggml-cpu/kleidiai/kernels.cpp",
+    "rule": "email",
+    "line_sha256": "a106ad950298963c04ea4bd3b7eb2bc5d8cff316819b4162e257fa4c76c3d8d6",
+    "reason": "Public upstream copyright attribution, source documentation or example; retained with upstream source notices."
+  },
+  {
+    "path": "linux/native/q5-core/ggml/src/ggml-cpu/kleidiai/kleidiai.h",
+    "rule": "email",
+    "line_sha256": "70e7f5986c228913831eee7dfaef956349577970b4989af292c5fd390ff5987b",
+    "reason": "Public upstream copyright attribution, source documentation or example; retained with upstream source notices."
+  },
+  {
+    "path": "linux/native/q5-core/ggml/src/ggml-cpu/kleidiai/kleidiai.cpp",
+    "rule": "email",
+    "line_sha256": "a106ad950298963c04ea4bd3b7eb2bc5d8cff316819b4162e257fa4c76c3d8d6",
+    "reason": "Public upstream copyright attribution, source documentation or example; retained with upstream source notices."
+  },
+  {
+    "path": "linux/native/q5-core/ggml/src/ggml-cpu/kleidiai/kernels.h",
+    "rule": "email",
+    "line_sha256": "a106ad950298963c04ea4bd3b7eb2bc5d8cff316819b4162e257fa4c76c3d8d6",
+    "reason": "Public upstream copyright attribution, source documentation or example; retained with upstream source notices."
+  }
+]

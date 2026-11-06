@@ -1,0 +1,111 @@
+"""Real multi-system, reasoning, streamed tool roundtrip and session regression."""
+import argparse
+import json
+import time
+import uuid
+from pathlib import Path
+import httpx
+
+ROOT=Path(__file__).resolve().parents[1]
+
+
+def main():
+    parser=argparse.ArgumentParser();parser.add_argument('--probe',action='store_true');args=parser.parse_args()
+    cfg=json.loads((ROOT/'config.local.json').read_text())
+    key=(ROOT/'state/api-key.txt').read_text().strip()
+    base='http://{}:{}'.format(cfg['host'],cfg['port'])
+    results=[];sid='combined-'+uuid.uuid4().hex[:12]
+    systems=[{'role':'system','content':'You are a precise assistant. Follow user requests and use provided tools.'},
+        {'role':'system','content':'Memory: the archive marker is ORCHID-593.'},
+        {'role':'system','content':'Report temperatures in Celsius. Never invent a tool result.'}]
+    tool={'type':'function','function':{'name':'get_temperature','description':'Get the current temperature for a city',
+        'parameters':{'type':'object','properties':{'city':{'type':'string'}},'required':['city']}}}
+    with httpx.Client(base_url=base,headers={'Authorization':'Bearer '+key},trust_env=False,timeout=300) as client:
+        if args.probe:
+            r=client.post('/v1/chat/completions',json={'model':cfg['model'],'messages':systems+[{'role':'user','content':'Say OK'}],
+                'stream':True,'max_tokens':64,'reasoning_effort':'none'})
+            print(json.dumps({'status':r.status_code,'body':r.text[:500]}));return
+
+        def stream(label,messages,**fields):
+            started=time.perf_counter();first=None;reasoning='';content='';calls={};finish=None;done=False;usage=None
+            with client.stream('POST','/v1/chat/completions',json={'model':cfg['model'],'messages':messages,
+                    'session_id':sid,'tools':[tool],'temperature':0,'seed':42,'max_completion_tokens':1024,
+                    'stream':True,'stream_options':{'include_usage':True},**fields}) as response:
+                response.raise_for_status();rid=response.headers['x-request-id']
+                for line in response.iter_lines():
+                    if not line.startswith('data: '):continue
+                    if line=='data: [DONE]':done=True;break
+                    event=json.loads(line[6:]);assert 'error' not in event,event
+                    if event.get('usage'):usage=event['usage']
+                    for choice in event.get('choices',[]):
+                        delta=choice.get('delta',{})
+                        if any(delta.get(k) for k in ('reasoning_content','content','tool_calls')) and first is None:
+                            first=time.perf_counter()-started
+                        reasoning+=delta.get('reasoning_content') or '';content+=delta.get('content') or ''
+                        for fragment in delta.get('tool_calls') or []:
+                            call=calls.setdefault(fragment['index'],{'id':'','type':'function','function':{'name':'','arguments':''}})
+                            if fragment.get('id'):call['id']=fragment['id']
+                            for k in ('name','arguments'):call['function'][k]+=fragment.get('function',{}).get(k) or ''
+                        finish=choice.get('finish_reason') or finish
+            assert done and usage and first is not None
+            message={'role':'assistant','content':content or None,'reasoning_content':reasoning}
+            if calls:message['tool_calls']=[calls[k] for k in sorted(calls)]
+            meta=client.get('/sessions/'+sid);meta.raise_for_status()
+            results.append({'label':label,'request_id':rid,'first_token_seconds':first,'finish_reason':finish,
+                'reasoning_characters':len(reasoning),'content':content,'tool_calls':list(calls.values()),
+                'usage':usage,'cache':meta.json()['last_request']})
+            print(json.dumps(results[-1]),flush=True)
+            return message
+
+        messages=systems+[{'role':'system','content':'Reference notes:\n'+('The archive records local weather observations. '*1300)},
+            {'role':'user','content':'Call get_temperature for Example City A, then report its temperature.'}]
+        first=stream('multi_system_reasoning_streamed_tool',messages,
+            tool_choice={'type':'function','function':{'name':'get_temperature'}})
+        assert first['reasoning_content'] and results[-1]['finish_reason']=='tool_calls'
+        call=first['tool_calls'][0];assert call['id'] and call['function']['name']=='get_temperature'
+        assert json.loads(call['function']['arguments'])['city'].lower()=='example city a'
+        messages += [first,{'role':'tool','tool_call_id':call['id'],'content':'{"temperature_celsius":23}'}]
+        second=stream('tool_result_continuation',messages,tool_choice='none')
+        assert '23' in (second['content'] or '') and not second.get('tool_calls')
+        assert results[-1]['cache']['timings']['cache_n']>8000
+        # A second tool call must be generated by the model after the first
+        # roundtrip, not merely inserted into a replay fixture.
+        messages += [second,{'role':'user','content':'Now call get_temperature for Example City B, then compare Example City B with the earlier Example City A result.'}]
+        next_call=stream('second_generated_tool_round',messages,
+            tool_choice={'type':'function','function':{'name':'get_temperature'}})
+        assert results[-1]['finish_reason']=='tool_calls'
+        call2=next_call['tool_calls'][0]
+        assert call2['id'] and call2['id']!=call['id']
+        assert call2['function']['name']=='get_temperature'
+        assert json.loads(call2['function']['arguments'])['city'].lower()=='example city b'
+        assert results[-1]['cache']['timings']['cache_n']>8000
+        messages += [next_call,{'role':'tool','tool_call_id':call2['id'],
+            'content':'{"city":"Example City B","temperature_celsius":18}'}]
+        compared=stream('second_tool_result_comparison',messages,tool_choice='none')
+        assert '18' in (compared['content'] or '') and '23' in compared['content']
+        assert not compared.get('tool_calls')
+        messages += [compared,{'role':'user','content':'What are my archive marker and the measured Example City A temperature? Reply briefly.'}]
+        third=stream('multi_turn_memory',messages,tool_choice='none')
+        assert 'ORCHID-593' in (third['content'] or '') and '23' in third['content']
+        # Controlled two-call assistant turn verifies replay of multiple tool results.
+        pair=[{'id':'lookup-example-city-b','type':'function','function':{'name':'get_temperature','arguments':'{"city":"Example City B"}'}},
+            {'id':'lookup-example-city-c','type':'function','function':{'name':'get_temperature','arguments':'{"city":"Example City C"}'}}]
+        messages += [third,{'role':'user','content':'Look up Example City B and Example City C, then list their temperatures.'},
+            {'role':'assistant','content':None,'reasoning_content':'I will look up both requested cities.','tool_calls':pair},
+            {'role':'tool','tool_call_id':'lookup-example-city-b','content':'{"city":"Example City B","temperature_celsius":18}'},
+            {'role':'tool','tool_call_id':'lookup-example-city-c','content':'{"city":"Example City C","temperature_celsius":26}'}]
+        fourth=stream('two_tool_results_replayed',messages,tool_choice='none')
+        assert '18' in (fourth['content'] or '') and '26' in fourth['content']
+        response=client.post('/v1/chat/completions',json={'model':cfg['model'],'messages':systems+[
+            {'role':'user','content':'Reply only with my archive marker.'}],'reasoning_effort':'none','temperature':0,'max_tokens':32})
+        response.raise_for_status();assert 'ORCHID-593' in response.json()['choices'][0]['message']['content']
+        invalid=client.post('/v1/chat/completions',json={'messages':[{'role':'user','content':'q'},systems[0]],'stream':True})
+        assert invalid.status_code==400 and invalid.json()['error']['type']=='invalid_request_error'
+        assert invalid.headers['x-request-id']==invalid.json()['error']['request_id']
+        assert client.get('/health').json()['status'] in ('ok','ready')
+    (ROOT/'reports/agent-combined-regression.json').write_text(json.dumps({'passed':True,'finished_unix':time.time(),
+        'results':results,'nonstream_multi_system':True,'invalid_order_400':True},indent=2))
+    print('COMBINED HARDWARE REGRESSION PASSED',flush=True)
+
+
+if __name__=='__main__':main()

@@ -1,0 +1,138 @@
+{
+  "models": {
+    "qwen3.8-27b": {
+      "command": [
+        "${ROOT}/runtime/q5/llama-server",
+        "--model",
+        "${ROOT}/models/q5.gguf",
+        "--alias",
+        "qwen3.8-27b",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        "17801",
+        "--ctx-size",
+        "197632",
+        "--parallel",
+        "1",
+        "--cache-type-k",
+        "q8_0",
+        "--cache-type-v",
+        "q8_0",
+        "--flash-attn",
+        "on",
+        "--cache-ram",
+        "0",
+        "--no-context-shift",
+        "--chat-template-file",
+        "${ROOT}/templates/openai-compatible-bare.jinja",
+        "--chat-template-kwargs",
+        "{\"enable_thinking\":false}",
+        "--mmproj",
+        "${ROOT}/models/q5-vision.gguf",
+        "--spec-type",
+        "draft-mtp",
+        "--spec-draft-n-max",
+        "3",
+        "--spec-draft-n-min",
+        "1",
+        "--spec-draft-p-min",
+        "0.0",
+        "--spec-draft-type-k",
+        "q8_0",
+        "--spec-draft-type-v",
+        "q8_0"
+      ],
+      "environment": {
+        "LLAMA_RECURRENT_CHECKPOINTS": "1",
+        "LD_LIBRARY_PATH": "${ROOT}/runtime/q5"
+      },
+      "url": "http://127.0.0.1:17801",
+      "artifacts": [
+        {
+          "path": "${ROOT}/runtime/q5/llama-server",
+          "sha256": null
+        },
+        {
+          "path": "${ROOT}/models/q5.gguf",
+          "sha256": null
+        },
+        {
+          "path": "${ROOT}/models/q5-vision.gguf",
+          "sha256": null
+        },
+        {
+          "path": "${ROOT}/templates/openai-compatible-bare.jinja",
+          "sha256": null
+        }
+      ]
+    },
+    "qwen3.8-flash": {
+      "command": [
+        "${ROOT}/runtime/flash/llama-server",
+        "--model",
+        "${ROOT}/models/flash.gguf",
+        "--alias",
+        "qwen3.8-flash",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        "17803",
+        "--ctx-size",
+        "197632",
+        "--parallel",
+        "1",
+        "--cache-type-k",
+        "q8_0",
+        "--cache-type-v",
+        "q8_0",
+        "--flash-attn",
+        "on",
+        "--cache-ram",
+        "0",
+        "--no-context-shift",
+        "--chat-template-file",
+        "${ROOT}/templates/openai-compatible-bare.jinja",
+        "--chat-template-kwargs",
+        "{\"enable_thinking\":false}",
+        "--mmproj",
+        "${ROOT}/models/flash-vision.gguf",
+        "--spec-type",
+        "draft-mtp",
+        "--spec-draft-n-max",
+        "2",
+        "--spec-draft-n-min",
+        "1",
+        "--spec-draft-p-min",
+        "0.0",
+        "--spec-draft-type-k",
+        "q8_0",
+        "--spec-draft-type-v",
+        "q8_0"
+      ],
+      "environment": {
+        "LLAMA_RECURRENT_CHECKPOINTS": "1",
+        "LD_LIBRARY_PATH": "${ROOT}/runtime/flash"
+      },
+      "url": "http://127.0.0.1:17803",
+      "artifacts": [
+        {
+          "path": "${ROOT}/runtime/flash/llama-server",
+          "sha256": null
+        },
+        {
+          "path": "${ROOT}/models/flash.gguf",
+          "sha256": null
+        },
+        {
+          "path": "${ROOT}/models/flash-vision.gguf",
+          "sha256": null
+        },
+        {
+          "path": "${ROOT}/templates/openai-compatible-bare.jinja",
+          "sha256": null
+        }
+      ]
+    }
+  }
+}
